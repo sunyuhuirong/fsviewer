@@ -1,13 +1,14 @@
 /**
  * fsviewer - 客户端插件（目录树 + Markdown 文件预览）
  *
- * 停靠式右侧边栏（非弹窗）：
+ * 停靠式文件面板（Codex 式，左预览右树）：
  *   - 顶部按钮挂在 conversation.session.header.utilities（session log 导出按钮右边），
  *     图标为「右侧栏」内联 SVG（圆角方框 + 靠右竖线），随主题着色。
- *   - 打开时通过 ctx.layout（ui-layout 提供）openDetails() 撑开原生右栏把中间内容
- *     推开，面板精确盖在右栏区域上（宽度对齐 360px）——观感即原生侧边栏。
- *   - 关闭时两者一起收起；切换会话时自动收起（原生布局本就会收右栏，这里保持同步）。
- *   - ctx.layout 不可用时自动退化为纯浮层（功能不丢，只是内容不被推开）。
+ *   - 打开时借原生右栏（ctx.layout openDetails）推挤内容，面板从右侧滑入停靠；
+ *     顶部按钮「钉」在视口原位不动（fixed 定位，成为面板右上角的常驻开关），
+ *     再次点击即收起。面板左缘可拖拽调宽，⤢ 全宽切换。
+ *   - 面包屑行的文件夹图标收起/展开右侧文件树；无文件时显示「打开文件」空状态。
+ *   - 切换会话时自动收起。
  *
  * 数据来源：
  *   - 目录列表（含文件）：主机半边注册的 GET /fsviewer-api/list（webServer 路由）
@@ -25,11 +26,22 @@
 import * as React from 'react'
 import { MarkdownText } from '@deepseek-ai/dsh-client-ui-primitives'
 
-// ---------- 面板开合状态（顶部按钮与面板共享） ----------
+// ---------- 面板开合状态（顶部按钮共享） ----------
+// 展开 = layout.openDetails()（原生右栏推挤内容）；收起 = closeDetails()。
 let panelOpen = false
 const panelListeners = new Set()
-// ui-layout 的布局服务，apply(ctx) 时捕获；缺失时退化为纯浮层
+// ui-layout 的布局服务：展开/收起原生右栏；apply(ctx) 时捕获
 let layoutApi = null
+// 原生系统打开（包装 workspaces.openPath 前保存，面板内 ⧉ 仍走系统打开）
+let nativeOpenPath = null
+// FileTreePanel 挂载时注册的程序化打开文件入口
+let panelFileDispatch = null
+function openFileInPanel(path) {
+  setPanelOpen(true)
+  if (layoutApi) layoutApi.openDetails()
+  if (panelFileDispatch) panelFileDispatch(path)
+  else if (nativeOpenPath) nativeOpenPath(path)
+}
 function subscribePanel(fn) { panelListeners.add(fn); return () => panelListeners.delete(fn) }
 function setPanelOpen(next) {
   panelOpen = typeof next === 'function' ? next(panelOpen) : next
@@ -40,22 +52,17 @@ function usePanelOpen() {
   React.useEffect(() => subscribePanel(() => force({})), [])
   return [panelOpen, setPanelOpen]
 }
-// 开：先把原生右栏归一到默认宽度再撑开（closeDetails+openDetails），
-// 避免此前拖拽/工具详情留下的其他宽度与浮层错位；关：两者一起收。
 function togglePanel() {
-  const next = !panelOpen
-  setPanelOpen(next)
-  if (!layoutApi) return
-  if (next) {
-    layoutApi.closeDetails()
-    layoutApi.openDetails()
-  } else {
-    layoutApi.closeDetails()
-  }
+  if (panelOpen) { closePanel(); return }
+  setPanelOpen(true)
+  if (layoutApi) layoutApi.openDetails()
 }
 function closePanel() {
   if (!panelOpen) return
   setPanelOpen(false)
+  // 收起时解除 ⤢ 展开覆盖，恢复原生宽度
+  wideOn = false
+  setExpandedFrame(false)
   if (layoutApi) layoutApi.closeDetails()
 }
 
@@ -84,6 +91,11 @@ function injectToggleStyle() {
     'align-items:center;padding:0;display:inline-flex}' +
     '.fsviewer-toggle:hover{background:var(--dsw-alias-interactive-bg-hover)}' +
     '.fsviewer-toggle--active{background:var(--dsw-alias-interactive-bg-active);color:var(--dsw-alias-label-primary)}' +
+    '.fsviewer-iconbtn{cursor:pointer;width:28px;height:28px;color:var(--dsw-alias-label-secondary);' +
+    'background:transparent;border:none;border-radius:50%;flex:none;justify-content:center;' +
+    'align-items:center;padding:0;display:inline-flex}' +
+    '.fsviewer-iconbtn:hover{background:var(--dsw-alias-interactive-bg-hover)}' +
+    '.fsviewer-iconbtn--active{background:var(--dsw-alias-interactive-bg-active);color:var(--dsw-alias-label-primary)}' +
     '.fsviewer-row{display:flex;align-items:center;padding:2px 4px;cursor:pointer;font-size:13px;' +
     'color:var(--dsw-alias-label-primary);white-space:nowrap;border-radius:3px}' +
     '.fsviewer-row:hover{background:var(--dsw-alias-interactive-bg-hover)}' +
@@ -93,17 +105,35 @@ function injectToggleStyle() {
     '.fsviewer-tab{flex:0 0 auto;display:inline-flex;align-items:center;gap:4px;max-width:120px;' +
     'padding:2px 6px;border-radius:6px;font-size:11px;cursor:pointer;color:var(--dsw-alias-label-secondary);' +
     'background:var(--dsw-alias-interactive-bg-hover);white-space:nowrap}' +
-    '.fsviewer-tab--active{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-active)}'
+    '.fsviewer-tab--active{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-active)}' +
+    '.fsv-expanded-frame{grid-template-columns:var(--fsv-grid, 280px minmax(0,1fr) 360px) !important}' +
+    '.fsv-expanded-frame [class*="handle"]{display:none !important}'
   document.head.appendChild(tag)
 }
 
 // ---------- 样式常量 ----------
-// 宽度对齐原生右栏默认 360px（openDetails 的契约默认值），窄屏收缩到视口的 85%
-const PANEL_CSS = 'min(360px, 85vw)'
-const PANEL_HIDDEN_RIGHT = 'calc(-1 * min(360px, 85vw))'
-// 叠放层级：高于普通页面内容与原生右栏（网格列），低于宿主弹窗层（常见 1000+）
-const Z_PANEL = 300
+// 面板渲染在原生 details 右栏内（宽度由原生列决定，用户可拖拽 300-520px）；
+// 树栏默认 150px，左缘可拖拽调宽（120-320px）
+const TREE_DEFAULT_WIDTH = 150
+let treeWidth = TREE_DEFAULT_WIDTH
 const Z_TRIGGER = 301
+// ⤢ 展开：覆盖 AppFrame 网格列宽（!important 压过内联样式），把右栏加宽到原生上限 520
+const EXPAND_CLASS = 'fsv-expanded-frame'
+let wideOn = false
+function setExpandedFrame(on) {
+  const col = document.querySelector('[class*="detailsCol"]')
+  const frame = col && col.parentElement
+  if (!frame) return
+  if (on) {
+    const cur = frame.style.gridTemplateColumns || getComputedStyle(frame).gridTemplateColumns
+    const parts = cur.split(' ')
+    if (parts.length >= 3) parts[parts.length - 1] = '520px'
+    frame.style.setProperty('--fsv-grid', parts.join(' '))
+    frame.classList.add(EXPAND_CLASS)
+  } else {
+    frame.classList.remove(EXPAND_CLASS)
+  }
+}
 // 颜色全部走宿主主题变量，明暗主题自动适配
 const V = {
   fill: 'var(--dsw-specific-sidebar-fill)',
@@ -180,18 +210,22 @@ function SidebarRightIcon() {
 }
 
 // ---------- 顶部切换按钮（注入会话头 utilities，位于 session log 导出按钮右边） ----------
-// session 作用域组件：拿到 sessionId，切换会话时自动收起面板，与原生右栏保持同步
+// session 作用域组件：拿到 sessionId，切换会话时自动收起面板。
+// 点击 = layout.openDetails()/closeDetails()（原生右栏推挤/收起，位置随头部移动、确定可预期）
 function FsToggleButton({ sessionId }) {
   const [open] = usePanelOpen()
-  const lastSession = React.useRef(sessionId)
+  // null=尚未记录（首帧赋值不算「切换」，避免会话恢复期间误关面板）
+  const lastSession = React.useRef(null)
   React.useEffect(() => {
+    if (lastSession.current === null) {
+      lastSession.current = sessionId
+      return
+    }
     if (lastSession.current !== sessionId) {
       lastSession.current = sessionId
       closePanel()
     }
   }, [sessionId])
-  // 会话关闭/按钮卸载时兜底收起，避免面板残留
-  React.useEffect(() => () => { closePanel() }, [])
   return (
     <button
       type="button"
@@ -206,6 +240,7 @@ function FsToggleButton({ sessionId }) {
 }
 
 // ---------- 文件树 + 预览状态 ----------
+// 布局为 Codex 式左右分栏：左侧预览（无激活文件时空状态），右侧目录树常显。
 function initState() {
   return {
     root: undefined,      // undefined=尚未解析；null=无 workspace；string=绝对路径
@@ -218,9 +253,8 @@ function initState() {
     expanded: {},         // path -> true（已展开）
     branches: {},         // path -> { status:'new'|'ok'|'err', entries, truncated, error }
     term: '',
-    view: 'tree',         // 'tree' | 'file'
     tabs: [],             // 已打开文件 [{ path, name }]（打开顺序）
-    activePath: null,     // 当前预览文件
+    activePath: null,     // 当前预览文件（null = 空状态）
     files: {},            // path -> { status:'loading'|'ok'|'err', content?, size?, truncated?, binary?, error? }
     sourceMode: false     // md：false=渲染视图，true=源码
   }
@@ -233,7 +267,7 @@ function openFileState(state, path) {
   const files = state.files[path]
     ? state.files
     : { ...state.files, [path]: { status: 'loading' } }
-  return { ...state, view: 'file', tabs, activePath: path, files, sourceMode: false }
+  return { ...state, tabs, activePath: path, files, sourceMode: false }
 }
 function reducer(state, action) {
   switch (action.type) {
@@ -280,7 +314,7 @@ function reducer(state, action) {
     case 'openFile':
       return openFileState(state, action.path)
     case 'activateTab':
-      return { ...state, view: 'file', activePath: action.path, sourceMode: false }
+      return { ...state, activePath: action.path, sourceMode: false }
     case 'closeTab': {
       const tabs = state.tabs.filter((t) => t.path !== action.path)
       const files = { ...state.files }
@@ -288,11 +322,9 @@ function reducer(state, action) {
       if (state.activePath !== action.path) return { ...state, tabs, files }
       const last = tabs[tabs.length - 1]
       return last
-        ? { ...state, tabs, files, activePath: last.path, view: 'file' }
-        : { ...state, tabs, files, activePath: null, view: 'tree' }
+        ? { ...state, tabs, files, activePath: last.path }
+        : { ...state, tabs, files, activePath: null }
     }
-    case 'backToTree':
-      return { ...state, view: 'tree' }
     case 'fileOk':
       return { ...state, files: { ...state.files, [action.path]: { status: 'ok', content: action.content, size: action.size, truncated: action.truncated, binary: action.binary } } }
     case 'fileErr':
@@ -304,27 +336,31 @@ function reducer(state, action) {
   }
 }
 
-// ---------- 目录行 ----------
-function DirRow({ entry, depth, expanded, loading, onToggle, onEnter, onOpen }) {
+// ---------- 目录行（Codex 式：细箭头 + 名称，无文件夹图标） ----------
+function Chevron({ open }) {
   return (
-    <div className="fsviewer-row" style={{ paddingLeft: 4 + depth * 14 }}>
-      <span style={{ width: 16, textAlign: 'center', color: V.muted, flex: '0 0 auto' }}
-        onClick={(e) => { e.stopPropagation(); onToggle() }}>{loading ? '⏳' : (expanded ? '▾' : '▸')}</span>
-      <span style={{ marginRight: 4, flex: '0 0 auto' }}>📂</span>
-      <span style={{ flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', paddingRight: 4 }}
-        onClick={onEnter} title={entry.path}>{entry.name}</span>
-      <span title="在系统文件管理器中打开"
-        style={{ color: V.muted, fontSize: '10px', padding: '0 4px' }}
-        onClick={(e) => { e.stopPropagation(); onOpen() }}>⧉</span>
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"
+      style={{ transform: open ? 'rotate(90deg)' : 'none', transition: 'transform 0.15s ease', flex: '0 0 auto' }}>
+      <path d="M6 3.5 10.5 8 6 12.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+function DirRow({ entry, depth, expanded, loading, onToggle }) {
+  return (
+    <div className="fsviewer-row" style={{ paddingLeft: 6 + depth * 14 }} onClick={onToggle} title={entry.path}>
+      <span style={{ width: 16, display: 'inline-flex', justifyContent: 'center', color: V.muted, flex: '0 0 auto' }}>
+        {loading ? '⏳' : <Chevron open={expanded} />}
+      </span>
+      <span style={{ flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', paddingLeft: 4 }}>{entry.name}</span>
     </div>
   )
 }
 
-// ---------- 文件行（彩色类型徽章；点击打开预览） ----------
-function FileRow({ entry, depth, onOpen }) {
+// ---------- 文件行（彩色类型徽章；点击打开预览；激活文件高亮） ----------
+function FileRow({ entry, depth, active, onOpen }) {
   const badge = fileBadge(entry.name)
   return (
-    <div className="fsviewer-row" style={{ paddingLeft: 20 + depth * 14 }}
+    <div className="fsviewer-row" style={{ paddingLeft: 20 + depth * 14, ...(active ? { backgroundColor: 'var(--dsw-alias-interactive-bg-active)' } : null) }}
       onClick={onOpen} title={entry.path}>
       <span className="fsviewer-badge" style={{ backgroundColor: badge.color }}>{badge.text}</span>
       <span style={{ flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', paddingRight: 4 }}>{entry.name}</span>
@@ -359,34 +395,65 @@ class PanelErrorBoundary extends React.Component {
   }
 }
 
-// ---------- 文件预览视图 ----------
-function FilePreview({ workspaces, state, dispatch }) {
-  const path = state.activePath
-  const file = state.files[path]
-  const name = baseName(path)
-  const isMd = isMdFile(name)
-
-  // 系统打开
-  const openInSystem = () => workspaces.openPath(path).catch((e) => console.error('[fsviewer] openPath:', e))
-
+// ---------- 图标（Codex 风格单色线性图标） ----------
+function IconMaximize15() {
   return (
-    <div style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-      {/* 文件操作条：返回 + 文件名 + 渲染/源码 + 系统打开 */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px', borderBottom: '1px solid ' + V.line, flex: '0 0 auto' }}>
-        <button type="button" onClick={() => dispatch({ type: 'backToTree' })} title="返回目录树" aria-label="返回目录树"
-          style={{ cursor: 'pointer', color: V.muted, background: 'transparent', border: 'none', padding: '2px 4px', fontSize: 13 }}>←</button>
-        <span style={{ flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, color: V.fg }} title={path}>{name}</span>
-        {isMd && file && file.status === 'ok' && !file.binary
-          ? <button type="button" onClick={() => dispatch({ type: 'toggleSource' })} title="切换渲染/源码"
-            style={{ cursor: 'pointer', flex: '0 0 auto', fontSize: 11, padding: '2px 8px', borderRadius: 4, border: '1px solid ' + V.line, background: state.sourceMode ? V.input : 'transparent', color: V.fg }}>
-            {state.sourceMode ? '渲染' : '源码'}</button>
-          : null}
-        <button type="button" onClick={openInSystem} title="在系统默认应用中打开"
-          style={{ cursor: 'pointer', flex: '0 0 auto', fontSize: 11, padding: '2px 6px', borderRadius: 4, border: '1px solid ' + V.line, background: 'transparent', color: V.fg }}>⧉</button>
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M9.5 2.5h4v4M6.5 13.5h-4v-4M13.5 2.5 9 7M2.5 13.5 7 9" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+function IconCopy15() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" stroke="currentColor" />
+      <path d="M10.5 3.5h-6a1 1 0 0 0-1 1v6" stroke="currentColor" strokeLinecap="round" />
+    </svg>
+  )
+}
+function IconFolder15() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M1.5 4.2c0-.9.7-1.6 1.6-1.6h2.8l1.6 1.8h5.4c.9 0 1.6.7 1.6 1.6v5.8c0 .9-.7 1.6-1.6 1.6H3.1c-.9 0-1.6-.7-1.6-1.6V4.2z" stroke="currentColor" strokeLinejoin="round" />
+    </svg>
+  )
+}
+// ---------- 空状态（未打开任何文件时，预览区居中提示，同 Codex） ----------
+function EmptyState() {
+  return (
+    <div style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8, color: V.muted }}>
+      <svg width="44" height="44" viewBox="0 0 16 16" fill="none" aria-hidden="true" style={{ opacity: 0.6 }}>
+        <path d="M1.5 4.2c0-.9.7-1.6 1.6-1.6h2.8l1.6 1.8h5.4c.9 0 1.6.7 1.6 1.6v5.8c0 .9-.7 1.6-1.6 1.6H3.1c-.9 0-1.6-.7-1.6-1.6V4.2z" stroke="currentColor" strokeLinejoin="round" />
+      </svg>
+      <div style={{ fontSize: 15, fontWeight: 600, color: V.fg }}>打开文件</div>
+      <div style={{ fontSize: 12 }}>从工作区目录树中选择文件</div>
+    </div>
+  )
+}
+
+// ---------- 文件预览（左侧主区：Codex 式大标题 + 复制，正文渲染/源码） ----------
+function FilePreview({ state }) {
+  const path = state.activePath
+  const file = state.files[path] || { status: 'loading' }
+  const isMd = isMdFile(baseName(path))
+  const copyContent = () => {
+    if (file.status === 'ok' && file.content != null && navigator.clipboard) {
+      navigator.clipboard.writeText(file.content).catch(() => {})
+    }
+  }
+  return (
+    <div style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', minHeight: 0, minWidth: 0 }}>
+      {/* 标题行：文件名 + 复制 */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '12px 16px 4px', flex: '0 0 auto' }}>
+        <span style={{ fontSize: 18, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={path}>{baseName(path)}</span>
+        <button type="button" onClick={copyContent} title="复制文件内容" aria-label="复制文件内容"
+          style={{ cursor: 'pointer', flex: '0 0 auto', color: V.muted, background: 'transparent', border: 'none', padding: 4, display: 'inline-flex' }}>
+          <IconCopy15 />
+        </button>
       </div>
-      {/* 内容区 */}
-      <div style={{ flex: '1 1 auto', overflow: 'auto', padding: '10px 12px', minWidth: 0 }}>
-        {!file || file.status === 'loading'
+      {/* 正文 */}
+      <div style={{ flex: '1 1 auto', overflow: 'auto', padding: '0 16px 14px', minWidth: 0 }}>
+        {file.status === 'loading'
           ? <div style={{ color: V.muted, textAlign: 'center', padding: 12, fontSize: 12 }}>⏳ 加载中...</div>
           : file.status === 'err'
             ? <div style={{ color: '#e06c75', fontSize: 12 }}>⚠ {file.error}</div>
@@ -394,10 +461,6 @@ function FilePreview({ workspaces, state, dispatch }) {
               ? <div style={{ textAlign: 'center', padding: 24, color: V.muted, fontSize: 12 }}>
                 <div style={{ fontSize: 28, marginBottom: 8 }}>🗂</div>
                 二进制文件，不支持预览（{fmtSize(file.size)}）
-                <div style={{ marginTop: 10 }}>
-                  <button type="button" onClick={openInSystem}
-                    style={{ cursor: 'pointer', fontSize: 12, padding: '4px 10px', borderRadius: 4, border: '1px solid ' + V.line, background: V.input, color: V.fg }}>⧉ 在系统中打开</button>
-                </div>
               </div>
               : <div>
                 {file.truncated
@@ -414,8 +477,8 @@ function FilePreview({ workspaces, state, dispatch }) {
   )
 }
 
-// ---------- 文件树视图 ----------
-function TreeView({ workspaces, state, dispatch }) {
+// ---------- 文件树栏（右侧窄栏：筛选 + 目录文件树；左缘可拖拽调宽） ----------
+function TreeColumn({ workspaces, state, dispatch, width, onResizeStart }) {
   function entryMatchesDeep(entry) {
     if (matches(state.term, entry.name)) return true
     if (entry.type !== 'directory') return false
@@ -432,6 +495,7 @@ function TreeView({ workspaces, state, dispatch }) {
       if (entry.type !== 'directory') {
         return (
           <FileRow key={entry.path} entry={entry} depth={depth}
+            active={entry.path === state.activePath}
             onOpen={() => dispatch({ type: 'openFile', path: entry.path })} />
         )
       }
@@ -456,8 +520,6 @@ function TreeView({ workspaces, state, dispatch }) {
             expanded={isExpanded}
             loading={loading}
             onToggle={() => dispatch({ type: 'toggle', path: entry.path })}
-            onEnter={() => dispatch({ type: 'setRoot', root: entry.path })}
-            onOpen={() => workspaces.openPath(entry.path).catch((e) => console.error('[fsviewer] openPath:', e))}
           />
           {childRows}
         </div>
@@ -468,100 +530,141 @@ function TreeView({ workspaces, state, dispatch }) {
   const visible = filterEntries(state.entries)
 
   return (
-    <div style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-      {/* 工具条 */}
-      <div style={{ display: 'flex', gap: 6, padding: '8px 12px', borderBottom: '1px solid ' + V.line, flex: '0 0 auto' }}>
-        <button onClick={() => dispatch({ type: 'refresh' })} title="刷新当前目录"
-          style={{ flex: 1, padding: '4px 0', backgroundColor: V.input, border: '1px solid ' + V.line, borderRadius: 4, color: V.fg, cursor: 'pointer', fontSize: 12 }}>🔄 刷新</button>
-        <button onClick={() => workspaces.pickDirectory().then((p) => { if (p) dispatch({ type: 'setRoot', root: p }) }, (e) => console.error('[fsviewer] pickDirectory:', e))} title="选择其他文件夹作为根目录"
-          style={{ flex: 1, padding: '4px 0', backgroundColor: V.input, border: '1px solid ' + V.line, borderRadius: 4, color: V.fg, cursor: 'pointer', fontSize: 12 }}>📂 选择目录</button>
-        <button onClick={() => { if (state.root) workspaces.openPath(state.root).catch((e) => console.error('[fsviewer] openPath:', e)) }} title="在系统文件管理器中打开当前目录"
-          style={{ flex: 1, padding: '4px 0', backgroundColor: V.input, border: '1px solid ' + V.line, borderRadius: 4, color: V.fg, cursor: 'pointer', fontSize: 12 }}>⧉ 打开</button>
-      </div>
-      {/* 搜索框 */}
-      <div style={{ padding: '8px 12px', flex: '0 0 auto' }}>
-        <input type="text" placeholder="🔍 筛选文件…" value={state.term}
+    <div style={{ width, flex: '0 0 auto', borderLeft: '1px solid ' + V.line, display: 'flex', flexDirection: 'column', minHeight: 0, position: 'relative' }}>
+      {/* 左缘拖拽调宽把手 */}
+      <div onPointerDown={onResizeStart} title="拖拽调整文件树宽度"
+        style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: 5, cursor: 'col-resize', zIndex: 1 }} />
+      {/* 筛选行 */}
+      <div style={{ display: 'flex', alignItems: 'center', padding: '10px 10px 8px', flex: '0 0 auto' }}>
+        <input id="fsviewer-filter" type="text" placeholder="筛选文件…" value={state.term}
           onChange={(e) => dispatch({ type: 'setTerm', term: e.target.value })}
-          style={{ width: '100%', boxSizing: 'border-box', padding: '5px 8px', backgroundColor: V.input, border: '1px solid ' + V.line, borderRadius: 4, color: V.fg, fontSize: 12 }} />
-      </div>
-      {/* 面包屑 */}
-      <div style={{ padding: '4px 12px 8px', borderBottom: '1px solid ' + V.line, flex: '0 0 auto', overflowX: 'auto', whiteSpace: 'nowrap', color: V.muted, fontSize: 12 }}>
-        {state.crumbs.length ? state.crumbs.map((crumb, idx) => (
-          <span key={crumb.path || idx}>
-            {idx > 0 ? <span style={{ color: V.line }}> / </span> : null}
-            <span onClick={() => dispatch({ type: 'setRoot', root: crumb.path })} style={{ cursor: 'pointer', color: V.accent }}>{crumb.name || crumb.path}</span>
-          </span>
-        )) : <span>…</span>}
+          style={{ flex: '1 1 auto', minWidth: 0, boxSizing: 'border-box', padding: '5px 8px', backgroundColor: V.input, border: '1px solid ' + V.line, borderRadius: 6, color: V.fg, fontSize: 12 }} />
       </div>
       {/* 状态/错误 */}
       {state.error ? <div style={{ padding: '8px 12px', color: '#e06c75', fontSize: 12, flex: '0 0 auto' }}>⚠ {state.error}</div> : null}
       {/* 目录 + 文件树 */}
-      <div style={{ flex: '1 1 auto', overflow: 'auto', padding: '4px 0' }}>
+      <div style={{ flex: '1 1 auto', overflow: 'auto', padding: '2px 0 4px' }}>
         {!state.root
           ? <div style={{ padding: 12, color: V.muted, textAlign: 'center' }}>未检测到 workspace 根目录</div>
           : state.loading && !state.entries.length
             ? <div style={{ padding: 12, color: V.muted, textAlign: 'center' }}>⏳ 加载中...</div>
             : !state.entries.length
-              ? <div style={{ padding: 12, color: V.muted, textAlign: 'center' }}>（当前目录为空）</div>
+              ? <div style={{ padding: 12, color: V.muted, textAlign: 'center' }}>（目录为空）</div>
               : renderRows(visible, 0)}
       </div>
-      {/* 底部截断/操作提示 */}
+      {/* 截断提示 */}
       {state.truncated
-        ? <div style={{ padding: '6px 12px', borderTop: '1px solid ' + V.line, color: V.muted, fontSize: 11, flex: '0 0 auto' }}>条目过多，列表已截断（最多 1000 项）</div>
+        ? <div style={{ padding: '6px 12px', borderTop: '1px solid ' + V.line, color: V.muted, fontSize: 11, flex: '0 0 auto' }}>条目过多，已截断（最多 1000 项）</div>
         : null}
-      <div style={{ padding: '6px 12px', borderTop: '1px solid ' + V.line, color: V.muted, fontSize: 11, flex: '0 0 auto' }}>▸ 目录点击展开/进入 · 点击文件预览（支持 Markdown）</div>
     </div>
   )
 }
 
-// ---------- 页签条（已打开文件，同参考截图的页签概念） ----------
-function TabStrip({ state, dispatch }) {
-  if (state.view !== 'file' || !state.tabs.length) return null
+// ---------- 页签条（Codex 式：面板左上角；无文件时显示「打开文件」伪页签，× 关闭面板） ----------
+function TabStrip({ state, dispatch, onClose }) {
   return (
-    <div style={{ display: 'flex', gap: 4, padding: '6px 12px 0', overflowX: 'auto', flex: '0 0 auto' }}>
-      {state.tabs.map((tab) => (
-        <span key={tab.path}
-          className={'fsviewer-tab' + (tab.path === state.activePath ? ' fsviewer-tab--active' : '')}
-          onClick={() => dispatch({ type: 'activateTab', path: tab.path })}
-          title={tab.path}>
-          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{tab.name}</span>
-          <span onClick={(e) => { e.stopPropagation(); dispatch({ type: 'closeTab', path: tab.path }) }}
-            title="关闭页签" style={{ opacity: 0.7, padding: '0 1px' }}>×</span>
-        </span>
-      ))}
+    <div style={{ display: 'flex', alignItems: 'center', gap: 4, flex: '1 1 auto', minWidth: 0, overflowX: 'auto', padding: '6px 0 6px 8px' }}>
+      {state.tabs.length === 0
+        ? (
+          <span className="fsviewer-tab fsviewer-tab--active" title="未打开文件">
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>打开文件</span>
+            <span onClick={(e) => { e.stopPropagation(); onClose() }} title="关闭面板" style={{ opacity: 0.7, padding: '0 1px' }}>×</span>
+          </span>
+        )
+        : state.tabs.map((tab) => (
+          <span key={tab.path}
+            className={'fsviewer-tab' + (tab.path === state.activePath ? ' fsviewer-tab--active' : '')}
+            onClick={() => dispatch({ type: 'activateTab', path: tab.path })}
+            title={tab.path}>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{tab.name}</span>
+            <span onClick={(e) => { e.stopPropagation(); dispatch({ type: 'closeTab', path: tab.path }) }}
+              title="关闭页签" style={{ opacity: 0.7, padding: '0 1px' }}>×</span>
+          </span>
+        ))}
+      <span className="fsviewer-tab" title="筛选文件" onClick={() => { const el = document.getElementById('fsviewer-filter'); if (el) el.focus() }}>+</span>
     </div>
   )
 }
 
-// ---------- 主面板（停靠在原生右栏上方，宽 360 与 openDetails 对齐） ----------
-function FileTreePanel({ workspaces }) {
-  const [open] = usePanelOpen()
+// ---------- 主面板（渲染在原生 details 右栏内：左预览 + 右树栏，顶部双栏） ----------
+function FileTreePanel({ workspaces, sessions }) {
   const [state, dispatch] = React.useReducer(reducer, undefined, initState)
 
-  // 面板内关闭也走 closePanel（同步收起原生右栏）
+  // 注册程序化打开入口：会话内点击文件引用经此在面板中预览
+  React.useEffect(() => {
+    panelFileDispatch = (p) => dispatch({ type: 'openFile', path: p })
+    return () => { panelFileDispatch = null }
+  }, [dispatch])
+  // 右栏可见性：原生列收起时宽度为 0（仍挂载）——宽度 > 80px 视为展开，才加载数据
+  const [visible, setVisible] = React.useState(false)
+  // 树栏宽度（模块级记忆）；树栏开关
+  const [treeW, setTreeW] = React.useState(treeWidth)
+  const [treeOn, setTreeOn] = React.useState(true)
+
+  // 空状态伪页签的 ×：收起面板（收起原生右栏）
   const onClose = () => closePanel()
 
-  // 首次「点开面板」时才解析默认根目录（最近 workspace -> 首个 workspace -> 无则 null）
+  // 跟踪原生右栏列宽 → 可见性
   React.useEffect(() => {
-    if (!open || state.root !== undefined) return
-    let root = null
-    try {
-      const snap = workspaces.list.getSnapshot()
-      if (snap && snap.items && snap.items.length) {
-        const rec = snap.items.find((w) => w.workspaceId === snap.recentWorkspaceId)
-        const chosen = rec || snap.items[0]
-        if (chosen && chosen.path) root = chosen.path
-      }
-    } catch (e) { console.error('[fsviewer] read workspaces list:', e) }
-    dispatch({ type: 'setRoot', root })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open])
+    const col = document.querySelector('[class*="detailsCol"]')
+    if (!col || typeof ResizeObserver === 'undefined') { setVisible(true); return }
+    const apply = () => setVisible(col.getBoundingClientRect().width > 80)
+    apply()
+    const ro = new ResizeObserver(apply)
+    ro.observe(col)
+    return () => ro.disconnect()
+  }, [])
 
-  // 每次打开面板自动刷新根目录层：会话中新产生的文件立即可见
+  // 面板可见时才解析默认根目录。优先级：
+  //   1) 当前会话的工作目录 cwd（用户正在聊天的项目）
+  //   2) workspaces 列表（最近优先 -> 首个）
+  // 两个存储都是异步装载的（服务重启后面板首开时快照可能还是空的），
+  // 因此先立即试一次，未就绪就订阅等数据到达后再落根。
   React.useEffect(() => {
-    if (open && state.root) dispatch({ type: 'refresh' })
+    if (!visible || state.root !== undefined) return
+    let disposed = false
+    const unsubs = []
+    const resolve = () => {
+      let root = null
+      try {
+        const ss = sessions.list.getSnapshot()
+        if (ss && ss.current !== undefined && ss.byId) {
+          const rec = ss.byId[ss.current]
+          if (rec && rec.cwd) root = rec.cwd
+        }
+        if (!root) {
+          const snap = workspaces.list.getSnapshot()
+          if (snap && snap.items && snap.items.length) {
+            const rec = snap.items.find((w) => w.workspaceId === snap.recentWorkspaceId)
+            const chosen = rec || snap.items[0]
+            if (chosen && chosen.path) root = chosen.path
+          }
+        }
+      } catch (e) { console.error('[fsviewer] resolve default root:', e) }
+      if (disposed) return true
+      if (root !== null) {
+        dispatch({ type: 'setRoot', root })
+        return true
+      }
+      return false
+    }
+    if (resolve()) return
+    const onChange = () => {
+      if (resolve() && unsubs.length) unsubs.forEach((u) => u())
+    }
+    try {
+      unsubs.push(sessions.list.subscribe(onChange))
+      unsubs.push(workspaces.list.subscribe(onChange))
+    } catch (e) { console.error('[fsviewer] subscribe root sources:', e) }
+    return () => { disposed = true; unsubs.forEach((u) => u()) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open])
+  }, [visible])
+
+  // 每次面板可见自动刷新根目录层：会话中新产生的文件立即可见
+  React.useEffect(() => {
+    if (visible && state.root) dispatch({ type: 'refresh' })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible])
 
   // root/nonce 变化 -> 加载根目录层（主机路由：目录 + 文件）
   React.useEffect(() => {
@@ -606,47 +709,108 @@ function FileTreePanel({ workspaces }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.activePath, state.files])
 
+  // 树栏左缘拖拽调宽：120-320px
+  const onTreeResizeStart = (e) => {
+    e.preventDefault()
+    const startX = e.clientX
+    const startW = treeWidth
+    const move = (ev) => {
+      treeWidth = Math.min(Math.max(startW + (startX - ev.clientX), 120), 320)
+      setTreeW(treeWidth)
+    }
+    const up = () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+      document.body.style.cursor = ''
+    }
+    document.body.style.cursor = 'col-resize'
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+  }
+
+  // ⤢ 加宽/还原：原生布局服务不暴露 setDetails（宽度合同 300-520 只能靠拖拽把手，
+  // 而把手对合成 pointer 有保护、无法程序化拖拽），故用 CSS !important 覆盖
+  // AppFrame 的网格列宽实现「加宽到上限 520」；还原 = 移除覆盖类，恢复原生内联样式。
+  const [wide, setWide] = React.useState(wideOn)
+  const toggleWide = () => {
+    wideOn = !wideOn
+    setWide(wideOn)
+    setExpandedFrame(wideOn)
+  }
+
+  const activeFile = state.activePath ? state.files[state.activePath] : null
+  const showSourceBtn = !!(state.activePath && isMdFile(baseName(state.activePath)) && activeFile && activeFile.status === 'ok' && !activeFile.binary)
+  const openFileInSystem = () => { if (state.activePath && nativeOpenPath) nativeOpenPath(state.activePath).catch((e) => console.error('[fsviewer] openPath:', e)) }
+
   return (
     <div style={{
-      position: 'fixed',
-      right: open ? 0 : PANEL_HIDDEN_RIGHT,
-      top: 0,
-      width: PANEL_CSS,
-      height: '100vh',
+      width: '100%',
+      height: '100%',
       backgroundColor: V.fill,
-      borderLeft: '1px solid ' + V.edge,
       color: V.fg,
-      transition: 'right 0.25s ease',
       overflow: 'hidden',
       display: 'flex',
       flexDirection: 'column',
-      zIndex: Z_PANEL,
       fontFamily: V.font,
-      fontSize: '13px',
-      pointerEvents: 'auto'
+      fontSize: '13px'
     }}>
-      {/* 标题栏 */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 12px', borderBottom: '1px solid ' + V.line, flex: '0 0 auto' }}>
-        <span style={{ fontWeight: 600, fontSize: '13px' }}>文件管理器</span>
-        <button type="button" onClick={onClose} title="关闭" aria-label="关闭文件管理器"
-          style={{ cursor: 'pointer', fontSize: '14px', color: V.muted, background: 'transparent', border: 'none', padding: '2px 4px' }}>✕</button>
+      {/* 行1：页签（无文件时「打开文件」伪页签，× 收起面板）… ⤢ 加宽/还原（原生 360⇄520 上限） */}
+      <div style={{ display: 'flex', alignItems: 'center', minHeight: 56, borderBottom: '1px solid ' + V.line, flex: '0 0 auto', paddingRight: 6 }}>
+        <TabStrip state={state} dispatch={dispatch} onClose={onClose} />
+        <div style={{ display: 'flex', alignItems: 'center', marginLeft: 'auto', flex: '0 0 auto' }}>
+          <button type="button" onClick={toggleWide} title={wide ? '恢复默认宽度' : '加宽面板（最大 520px）'} aria-label="切换加宽"
+            className={'fsviewer-iconbtn' + (wide ? ' fsviewer-iconbtn--active' : '')}><IconMaximize15 /></button>
+        </div>
       </div>
-      {/* 页签条（文件视图下显示已打开文件） */}
-      <TabStrip state={state} dispatch={dispatch} />
-      {state.view === 'file'
-        ? <FilePreview workspaces={workspaces} state={state} dispatch={dispatch} />
-        : <TreeView workspaces={workspaces} state={state} dispatch={dispatch} />}
+      {/* 行2：面包屑 … 查看源代码 / 文件夹（收展树栏）/ 打开 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '5px 20px 5px 10px', borderBottom: '1px solid ' + V.line, flex: '0 0 auto' }}>
+        <span style={{ flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, color: V.muted }}>
+          {state.root ? baseName(state.root) : '…'}
+          {state.activePath ? <span><span style={{ color: V.edge }}> › </span><span style={{ color: V.fg }}>{baseName(state.activePath)}</span></span> : null}
+        </span>
+        {showSourceBtn
+          ? <button type="button" onClick={() => dispatch({ type: 'toggleSource' })} title="切换渲染/源码视图"
+            style={{ cursor: 'pointer', flex: '0 0 auto', fontSize: 12, padding: '3px 10px', borderRadius: 6, border: '1px solid ' + V.line, background: state.sourceMode ? V.input : 'transparent', color: V.fg }}>
+            {state.sourceMode ? '渲染视图' : '查看源代码'}</button>
+          : null}
+        <button type="button" onClick={() => setTreeOn(!treeOn)} title={treeOn ? '收起文件树' : '展开文件树'} aria-label="切换文件树"
+          style={{ cursor: 'pointer', flex: '0 0 auto', color: treeOn ? V.fg : V.muted, background: treeOn ? 'var(--dsw-alias-interactive-bg-active)' : 'transparent', border: '1px solid ' + V.line, borderRadius: 6, padding: 4, display: 'inline-flex' }}>
+          <IconFolder15 />
+        </button>
+        {state.activePath
+          ? <button type="button" onClick={openFileInSystem} title="用系统默认应用打开此文件"
+            style={{ cursor: 'pointer', flex: '0 0 auto', fontSize: 12, padding: '3px 12px', borderRadius: 6, border: 'none', background: V.accent, color: '#fff' }}>
+            ⧉ 打开</button>
+          : null}
+      </div>
+      {/* 内容：左预览（无激活文件时空状态） | 右文件树栏（可拖拽调宽） */}
+      <div style={{ flex: '1 1 auto', display: 'flex', minHeight: 0 }}>
+        {state.activePath ? <FilePreview state={state} /> : <EmptyState />}
+        {treeOn ? <TreeColumn workspaces={workspaces} state={state} dispatch={dispatch} width={treeW} onResizeStart={onTreeResizeStart} /> : null}
+      </div>
     </div>
   )
 }
 
 // ---------- 插件契约 ----------
-export const inject = ['slots', 'workspaces', 'layout']
+export const inject = ['slots', 'workspaces', 'sessions', 'layout']
 
 export function apply(ctx) {
   injectToggleStyle()
-  // 捕获布局服务：打开/关闭时同步原生右栏（缺失时退化为纯浮层）
+  // 捕获布局服务：顶部按钮开/收原生右栏
   layoutApi = ctx.layout || null
+  // 拦截系统打开：会话内点击文件引用改道到插件预览（保留原生打开供面板 ⧉ 使用）。
+  // 目录（尾斜杠）与插件未就绪时保持原生行为。
+  if (ctx.workspaces && typeof ctx.workspaces.openPath === 'function') {
+    nativeOpenPath = ctx.workspaces.openPath.bind(ctx.workspaces)
+    ctx.workspaces.openPath = (path) => {
+      if (typeof path === 'string' && path.length > 0 && !path.endsWith('/')) {
+        openFileInPanel(path)
+        return Promise.resolve()
+      }
+      return nativeOpenPath(path)
+    }
+  }
   // 顶部切换按钮：会话头 utilities 区，位于 session log 导出按钮右边（order 更大）。
   // 工厂透传 props，组件才能拿到 sessionId（session 作用域）
   ctx.slots.inject('conversation.session.header.utilities', () =>
@@ -655,16 +819,18 @@ export function apply(ctx) {
       (props) => React.createElement(FsToggleButton, props)
     )
   )
-  // 文件面板：挂到 shell.overlay，视觉上停靠在原生右栏上方（保留渲染级错误边界）
-  ctx.slots.inject('shell.overlay', () =>
+  // 文件面板：直接接管原生 details 右栏（影子注册）。single 槽位同优先级冲突，
+  // 不同优先级影子共存——conversation 的工具详情面板未传 priority（=0），
+  // 本插件用 -10（更低者优先渲染）接管该栏；本插件停用后原生工具详情自动恢复。
+  ctx.slots.inject('details', () =>
     ctx.slots.register(
-      { name: 'shell.overlay', id: 'fsviewer', order: 100, label: '文件管理器' },
+      { name: 'details', id: 'fsviewer-panel', priority: -10 },
       () => React.createElement(
         PanelErrorBoundary,
         null,
-        React.createElement(FileTreePanel, { workspaces: ctx.workspaces })
+        React.createElement(FileTreePanel, { workspaces: ctx.workspaces, sessions: ctx.sessions })
       )
     )
   )
-  console.log('[fsviewer] Client plugin loaded (docked sidebar, file list + md preview)')
+  console.log('[fsviewer] Client plugin loaded (native details column takeover: preview + tree)')
 }

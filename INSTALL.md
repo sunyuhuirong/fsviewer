@@ -1,18 +1,25 @@
 # fsviewer 安装指南
 
-一个纯客户端插件：在 dsh web 界面右侧展示**目录树**。
-注意：只显示目录（文件夹），**不显示普通文件，也不支持预览文件内容**。
+一个「主机 + 浏览器」双半边插件：在 dsh web 界面右侧停靠**文件浏览器**——
+目录树（目录 + 文件，带彩色类型徽章）、**Markdown 渲染预览**（可切源码）、
+文件页签、面包屑导航与目录过滤。
 
 ## 前置条件
 
 - 已安装 Node.js 18+ 与 dsh
 - 本插件目录的绝对路径（下文用 `<插件路径>` 表示，例如 `/Users/你/Desktop/deepseek-harness/plugin-fsviewer`）
 
-## 重要：本插件依赖 browse 目录能力
+## 重要 1：必须重启 dsh web
 
-`fsviewer` 的目录数据来自 `host.listDirectory`（browse 能力）。dsh 默认的
+本插件有**主机半边**（通过 `ctx.webServer` 注册 `/fsviewer-api` 文件读取路由），
+主机半边只在 `dsh web` 启动时加载。改完安装配置或重新构建后，**必须重启 dsh web**；
+只改浏览器端代码（src/client.js → npm run build）时刷新页面即可。
+
+## 重要 2：本插件依赖 browse 目录能力
+
+`fsviewer` 的「选择目录 / 系统打开」来自 `host.listDirectory` 等 browse 能力。dsh 默认的
 `directory-picker-auto` 在**本地 macOS/Windows 启动**时会解析为 native 后端
-（只弹系统选框，不支持目录列举），导致面板报错
+（只弹系统选框，不支持目录列举），导致相关功能报错
 `host.listDirectory needs the browse capability`。
 
 因此安装时需按官方换装点把目录选择器固定为 browse 后端（见下面第 3 步）。
@@ -87,18 +94,22 @@ dsh web
 
 浏览器打开 dsh web 后：
 
-1. 页面右侧中部出现蓝色 📁 按钮
-2. 点开按钮，面板显示当前工作区的子目录列表（真实数据）
-3. 点击目录名可进入，面包屑可回退
-4. 服务端自检：`curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3080/plugins/fsviewer/client.js` 应返回 `200`
+1. 顶部 Session log 导出按钮右边出现「右侧栏」图标按钮；`dsh web` 启动日志含
+   `[fsviewer] Host routes ready`
+2. 点开按钮，面板显示当前会话工作目录的**目录 + 文件**列表（文件带彩色徽章）
+3. 点击 `.md` 文件直接渲染预览（「源码」按钮可切原始文本）；点击目录名可进入，面包屑可回退
+4. 接口自检：
+   `curl -s 'http://127.0.0.1:3080/fsviewer-api/list?path=/tmp'` 应返回 JSON（entries 数组）
 
 ## 常见问题
 
 | 现象 | 可能原因与处理 |
 |------|----------------|
-| 没有出现 📁 按钮 | `dsh.profile.bundles` 没加 `fsviewer`；`node_modules/fsviewer` 链接丢失（重新 `pnpm install` 或手工重建链接）；改完忘记重启 |
-| 面板报 `needs the browse capability` | 第 3 步的 browse 后端配置缺失或写错 |
-| 改了代码不生效 | 先在插件目录执行 `npm run build` 重新生成 `lib/client.js`，再重启 dsh web |
+| 没有出现「右侧栏」按钮 | `dsh.profile.bundles` 没加 `fsviewer`；`node_modules/fsviewer` 链接丢失（重新 `pnpm install` 或手工重建链接）；改完忘记重启；当前在空白首页（需先进入一个会话） |
+| 面板显示「未检测到 workspace 根目录」 | 稍等片刻（列表异步装载）或用「📂 选择目录」手动指定根目录 |
+| 点击文件预览报网络异常 | 主机半边未加载：确认 `dsh web` 启动日志有 `[fsviewer] Host routes ready`；没有则重启 dsh web |
+| 「选择目录/打开」报 `needs the browse capability` | browse 后端配置（第 3 步）缺失或写错 |
+| 改了代码不生效 | `npm run build` 后：只改了 src/client.js 刷新页面即可；动过 src/index.js 必须重启 dsh web |
 
 ## 从源码构建
 

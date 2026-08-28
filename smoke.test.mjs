@@ -62,17 +62,18 @@ exports.apply(stubCtx)
 
 if (registrations.length !== 2) throw new Error('expected exactly 2 slot registrations, got ' + registrations.length)
 const utilReg = registrations.find((r) => r.meta.name === 'conversation.session.header.utilities')
-const overlayReg = registrations.find((r) => r.meta.name === 'shell.overlay')
+const detailsReg = registrations.find((r) => r.meta.name === 'details')
 if (!utilReg) throw new Error('missing utilities registration')
 if (utilReg.meta.id !== 'fsviewer-toggle') throw new Error('wrong utilities id: ' + utilReg.meta.id)
-if (!overlayReg) throw new Error('missing overlay registration')
-if (overlayReg.meta.id !== 'fsviewer') throw new Error('wrong overlay id: ' + overlayReg.meta.id)
-const reg = overlayReg
+if (!detailsReg) throw new Error('missing details registration')
+if (detailsReg.meta.id !== 'fsviewer-panel') throw new Error('wrong details id: ' + detailsReg.meta.id)
+if (detailsReg.meta.priority !== -10) throw new Error('details priority should be -10 (shadow conversation), got ' + detailsReg.meta.priority)
+const reg = detailsReg
 if (!reg.comp || !reg.comp.element) throw new Error('component factory returned unexpected value')
 
 console.log('SMOKE OK')
 console.log('  utilities slot:', utilReg.meta.name, '| id:', utilReg.meta.id)
-console.log('  overlay slot:', reg.meta.name, '| id:', reg.meta.id, '| label:', reg.meta.label)
+console.log('  details slot:', reg.meta.name, '| id:', reg.meta.id, '| priority:', reg.meta.priority)
 console.log('  inject:', exports.inject.join(', '))
 console.log('  component:', reg.comp.element ? 'React element' : typeof reg.comp)
 
