@@ -1,0 +1,5 @@
+# fsviewer bundle patch：把本插件插入 profile 的加载层。
+# 由 package.json 的 dsh.bundle.patch 声明引用。
+- insert:
+    - id: fsviewer
+      name: 'fsviewer'
