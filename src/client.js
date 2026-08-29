@@ -1,26 +1,29 @@
 /**
- * fsviewer - 客户端插件（目录树 + Markdown 文件预览）
+ * fsviewer - 客户端插件（文件面板 + 浏览器视图 + 侧边聊天，Codex 式右缘工作区）
  *
- * 停靠式文件面板（Codex 式，左预览右树）：
- *   - 顶部按钮挂在 conversation.session.header.utilities（session log 导出按钮右边），
- *     图标为「右侧栏」内联 SVG（圆角方框 + 靠右竖线），随主题着色。
- *   - 打开时借原生右栏（ctx.layout openDetails）推挤内容，面板从右侧滑入停靠；
- *     顶部按钮「钉」在视口原位不动（fixed 定位，成为面板右上角的常驻开关），
- *     再次点击即收起。面板左缘可拖拽调宽，⤢ 全宽切换。
- *   - 面包屑行的文件夹图标收起/展开右侧文件树；无文件时显示「打开文件」空状态。
- *   - 切换会话时自动收起。
+ * 内容列（原生 details 右栏，priority -10 影子接管）：
+ *   - 分段控件 [文件 | 浏览器] 切换视图（localStorage 持久化）。
+ *   - 文件视图：顶部按钮挂在 conversation.session.header.utilities，图标为「右侧栏」
+ *     内联 SVG；打开时借原生右栏（layout.openDetails）推挤内容；左预览右树，
+ *     页签/筛选/拖宽/⤢ 加宽等既有交互不变。
+ *   - 浏览器视图：URL 栏 + iframe（直连/代理两种模式）。代理经宿主 /fsviewer-api/p/
+ *     同源回源，绕过 X-Frame-Options；一律沙箱（无 allow-same-origin / top 导航）。
+ *
+ * 侧边聊天（原生 shell.overlay 全帧浮层槽位，additive）：
+ *   - 右缘 380px 全高停靠面板，与内容列互斥占用右缘：打开聊天自动收起内容列、
+ *     关闭时按记忆恢复；内容列打开时聊天自动让位。
+ *   - 直连 POST /fsviewer-api/chat（宿主 ctx.llm 流式调用，SSE 下发），assistant
+ *     消息用官方 MarkdownText streaming 渲染；「引用当前文件」把预览中的文件内容
+ *     注入消息上下文；历史 localStorage 持久化（防 HMR 丢失）。
+ *   - 入口：会话头聊天按钮（order 51，文件按钮右侧）+ 快捷键 ⌥⌘S；⌥⌘T 打开浏览器
+ *     视图（⌘T 留给浏览器本体）。dsh 无原生快捷键注册 API，用 e.code DOM 监听。
  *
  * 数据来源：
- *   - 目录列表（含文件）：主机半边注册的 GET /fsviewer-api/list（webServer 路由）
- *   - 文件内容：GET /fsviewer-api/file（1MB 上限，二进制不回传）
+ *   - 目录/文件：GET /fsviewer-api/list、/file；聊天：POST /fsviewer-api/chat（SSE）
+ *   - 浏览器代理：GET /fsviewer-api/p/<URL>
  *   - workspaces.list 仅用于解析默认根目录；选择目录 / 系统打开继续用 workspaces
  *
- * 预览：
- *   - .md 文件用官方聊天同款 MarkdownText 渲染（可切「源码」）
- *   - 其他文本文件显示源码；二进制/超大文件给出提示 + 系统打开入口
- *   - 已打开文件以小页签呈现，可切换/关闭
- *
- * 插件契约：exports.inject = ["slots", "workspaces", "layout"]。
+ * 插件契约：exports.inject = ["slots", "workspaces", "sessions", "layout"]。
  */
 
 import * as React from 'react'
@@ -38,6 +41,195 @@ let nativeOpenPath = null
 let panelFileDispatch = null
 // FileTreePanel 挂载时注册的程序化「树根跳转」入口（目录引用点击 → 面板树定位）
 let panelDirDispatch = null
+
+// ---------- 右缘表面调度：侧边聊天 / 内容列互斥占用右缘 ----------
+// 打开聊天时收起内容列（并记忆它原本开着，关闭聊天时恢复），反之亦然——
+// 右缘同一时刻只呈现一个表面，等效 Codex 的「内容 tab + 右侧聊天」。
+let chatOpen = false
+let detailsOpenBeforeChat = false
+const chatOpenListeners = new Set()
+// 内容列当前视图：'files' | 'browser'（分段控件切换，localStorage 持久化防 HMR 丢失）
+let contentView = 'files'
+try {
+  const saved = localStorage.getItem('fsviewer/content-view.v1')
+  if (saved === 'files' || saved === 'browser') contentView = saved
+} catch { /* 无 localStorage（非浏览器环境）按默认 */ }
+const contentViewListeners = new Set()
+
+function subscribeChatOpen(fn) { chatOpenListeners.add(fn); return () => chatOpenListeners.delete(fn) }
+function setChatOpen(next) {
+  const v = typeof next === 'function' ? next(chatOpen) : next
+  if (v === chatOpen) return
+  chatOpen = v
+  chatOpenListeners.forEach((l) => l())
+}
+function useChatOpen() {
+  const [, force] = React.useState()
+  React.useEffect(() => subscribeChatOpen(() => force({})), [])
+  return chatOpen
+}
+function openChat() {
+  detailsOpenBeforeChat = panelOpen
+  if (panelOpen) closePanel()
+  setChatOpen(true)
+}
+function closeChat() {
+  if (!chatOpen) return
+  setChatOpen(false)
+  if (detailsOpenBeforeChat) {
+    detailsOpenBeforeChat = false
+    openPanelWithRoom()
+  }
+}
+function toggleChat() { chatOpen ? closeChat() : openChat() }
+
+function subscribeContentView(fn) { contentViewListeners.add(fn); return () => contentViewListeners.delete(fn) }
+function setContentView(v) {
+  if (v === contentView) return
+  contentView = v
+  try { localStorage.setItem('fsviewer/content-view.v1', v) } catch { /* 忽略 */ }
+  contentViewListeners.forEach((l) => l())
+}
+function useContentView() {
+  const [, force] = React.useState()
+  React.useEffect(() => subscribeContentView(() => force({})), [])
+  return contentView
+}
+
+// ---------- 当前预览文件上下文（聊天「引用当前文件」的数据源） ----------
+// FileTreePanel 在激活文件内容就绪时写入；无激活文件/二进制时清空
+let currentFileCtx = null
+const fileCtxListeners = new Set()
+function setCurrentFileCtx(next) {
+  const prev = currentFileCtx
+  if (prev === next) return
+  if (prev && next && prev.path === next.path && prev.content === next.content && prev.truncated === next.truncated) return
+  currentFileCtx = next
+  fileCtxListeners.forEach((l) => l())
+}
+function useCurrentFileCtx() {
+  const [, force] = React.useState()
+  React.useEffect(() => {
+    fileCtxListeners.add(force)
+    return () => fileCtxListeners.delete(force)
+  }, [])
+  return currentFileCtx
+}
+
+// ---------- 聊天数据（模块级单例：开合/挂载周期与消息流解耦，localStorage 持久化） ----------
+const CHAT_STORE_KEY = 'fsviewer/chat.v1'
+const CHAT_QUOTE_CHARS = 32000     // 引用文件注入正文的上限
+const chatStore = {
+  messages: [],   // {role:'user'|'assistant', content, reasoning?, streaming?, error?, note?}
+  route: null,    // SSE meta 帧回显的 {provider, model}
+  streaming: false
+}
+let chatHydrated = false
+let chatAbort = null
+const chatListeners = new Set()
+function hydrateChat() {
+  if (chatHydrated) return
+  chatHydrated = true
+  try {
+    const data = JSON.parse(localStorage.getItem(CHAT_STORE_KEY) || 'null')
+    if (data && Array.isArray(data.messages)) {
+      chatStore.messages = data.messages
+        .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.length)
+        .slice(-60)
+    }
+    if (data && data.route && typeof data.route.provider === 'string') chatStore.route = data.route
+  } catch { /* 历史损坏按空处理 */ }
+}
+function persistChat() {
+  try {
+    localStorage.setItem(CHAT_STORE_KEY, JSON.stringify({
+      messages: chatStore.messages.slice(-60).filter((m) => !m.error).map((m) => ({ role: m.role, content: m.content })),
+      route: chatStore.route
+    }))
+  } catch { /* 配额满等忽略 */ }
+}
+function notifyChat() { chatListeners.forEach((l) => l()) }
+function subscribeChat(fn) { chatListeners.add(fn); return () => chatListeners.delete(fn) }
+function lastAssistant() {
+  const m = chatStore.messages[chatStore.messages.length - 1]
+  return m && m.role === 'assistant' ? m : null
+}
+
+/** 发送一轮：追加 user + 空 assistant，读 SSE 帧增量填充；abort/错误都落在 assistant 消息上 */
+async function sendChat(text, fileCtx) {
+  const trimmed = text.trim()
+  if (!trimmed || chatStore.streaming) return
+  let content = trimmed
+  if (fileCtx && typeof fileCtx.content === 'string') {
+    const clip = fileCtx.content.slice(0, CHAT_QUOTE_CHARS)
+    const more = fileCtx.content.length > CHAT_QUOTE_CHARS ? '\n…（已截断）' : ''
+    content += '\n\n---\n[引用文件: ' + fileCtx.path + (fileCtx.truncated ? '，前 1MB' : '') + ']\n```\n' + clip + more + '\n```'
+  }
+  chatStore.messages = chatStore.messages.concat([
+    { role: 'user', content },
+    { role: 'assistant', content: '', streaming: true }
+  ])
+  chatStore.streaming = true
+  notifyChat(); persistChat()
+  const ctrl = new AbortController()
+  chatAbort = ctrl
+  try {
+    const res = await fetch('/fsviewer-api/chat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        messages: chatStore.messages.slice(0, -1).map((m) => ({ role: m.role, content: m.content }))
+      }),
+      signal: ctrl.signal
+    })
+    if (!res.ok || !res.body) {
+      let msg = 'HTTP ' + res.status
+      try { const j = await res.json(); if (j && j.error) msg = j.error } catch { /* 非 JSON 错误体 */ }
+      throw new Error(msg)
+    }
+    const reader = res.body.getReader()
+    const dec = new TextDecoder()
+    let buf = ''
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += dec.decode(value, { stream: true })
+      let i
+      while ((i = buf.indexOf('\n\n')) >= 0) {
+        const frame = buf.slice(0, i)
+        buf = buf.slice(i + 2)
+        const dataLine = frame.split('\n').find((l) => l.startsWith('data:'))
+        if (!dataLine) continue
+        let evt
+        try { evt = JSON.parse(dataLine.slice(5).trim()) } catch { continue }
+        const m = lastAssistant()
+        if (evt.meta && evt.meta.provider) chatStore.route = evt.meta
+        else if (evt.delta && m) {
+          if (typeof evt.delta.text === 'string') m.content += evt.delta.text
+          else if (typeof evt.delta.reasoning === 'string') m.reasoning = (m.reasoning || '') + evt.delta.reasoning
+        } else if (evt.error && m) m.error = evt.error
+        else if (evt.done && evt.done.finish === 'max-tokens' && m) m.note = '回复达到 token 上限，可能被截断'
+        notifyChat()
+      }
+    }
+  } catch (e) {
+    const m = lastAssistant()
+    if (!ctrl.signal.aborted && m) m.error = humanError(e)
+  } finally {
+    const m = lastAssistant()
+    if (m) delete m.streaming
+    chatStore.streaming = false
+    chatAbort = null
+    notifyChat(); persistChat()
+  }
+}
+function stopChat() { if (chatAbort) chatAbort.abort() }
+function clearChat() {
+  if (chatStore.streaming) stopChat()
+  chatStore.messages = []
+  chatStore.route = null
+  notifyChat(); persistChat()
+}
 
 // ---------- 小窗口展开前的让位 ----------
 // 原生让位链：details 先被挤压、再自动关闭（保 center ≥ 640），左栏从不让位。
@@ -126,6 +318,11 @@ function applySqueezeIfNeeded(sidebarW) {
   }
 }
 function openPanelWithRoom() {
+  // 右缘互斥：内容列要展开，聊天面板让位（不记忆聊天前的 details 状态，避免循环恢复）
+  if (chatOpen) {
+    detailsOpenBeforeChat = false
+    setChatOpen(false)
+  }
   setPanelOpen(true)
   const sidebarW = ensureRoomForDetails()
   if (layoutApi) layoutApi.openDetails()
@@ -215,7 +412,30 @@ function injectToggleStyle() {
     '.fsviewer-tip:hover::after{content:attr(data-tip);position:absolute;top:calc(100% + 6px);right:0;' +
     'background:var(--dsw-alias-label-primary);color:var(--dsw-alias-label-primary-inverted);' +
     'font-size:12px;line-height:1;padding:6px 9px;border-radius:6px;white-space:nowrap;z-index:60;' +
-    'pointer-events:none;box-shadow:0 4px 12px rgba(0,0,0,.18)}'
+    'pointer-events:none;box-shadow:0 4px 12px rgba(0,0,0,.18)}' +
+    // 内容列分段控件 [文件|浏览器]
+    '.fsviewer-seg{display:inline-flex;align-items:center;gap:2px;flex:0 0 auto;padding:2px;' +
+    'border-radius:8px;border:1px solid ' + V.line + ';background:var(--dsw-alias-bg-base)}' +
+    '.fsviewer-seg button{height:22px;padding:0 9px;border:none;border-radius:6px;background:transparent;' +
+    'color:var(--dsw-alias-label-secondary);font-size:12px;cursor:pointer;display:inline-flex;' +
+    'align-items:center;font-family:inherit}' +
+    '.fsviewer-seg button:hover{color:var(--dsw-alias-label-primary)}' +
+    '.fsviewer-seg button.on{background:var(--dsw-alias-interactive-bg-active);color:var(--dsw-alias-label-primary)}' +
+    // 侧边聊天
+    '.fsviewer-chat-panel{position:fixed;top:0;right:0;bottom:0;width:380px;max-width:92vw;' +
+    'display:flex;flex-direction:column;background:var(--dsw-specific-sidebar-fill);' +
+    'border-left:1px solid ' + V.line + ';z-index:30;pointer-events:auto;overflow:hidden}' +
+    '.fsviewer-chat-scroll{flex:1 1 auto;overflow-y:auto;overflow-x:hidden;padding:12px 14px;' +
+    'display:flex;flex-direction:column;gap:10px;min-height:0}' +
+    '.fsviewer-chat-user{align-self:flex-end;max-width:88%;background:var(--dsw-alias-interactive-bg-hover);' +
+    'border-radius:12px;padding:8px 11px;font-size:13px;line-height:1.55;white-space:pre-wrap;' +
+    'word-break:break-word;color:var(--dsw-alias-label-primary)}' +
+    '.fsviewer-chat-ai{align-self:stretch;min-width:0;font-size:13px;line-height:1.6;' +
+    'color:var(--dsw-alias-label-primary);word-break:break-word}' +
+    '.fsviewer-chat-quote{display:inline-flex;align-items:center;gap:4px;max-width:100%;' +
+    'padding:3px 8px;border-radius:999px;border:1px solid ' + V.line + ';background:transparent;' +
+    'color:var(--dsw-alias-label-secondary);font-size:11px;cursor:pointer;overflow:hidden;white-space:nowrap}' +
+    '.fsviewer-chat-quote.on{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-active)}'
   document.head.appendChild(tag)
 }
 
@@ -559,6 +779,44 @@ const FINDER_ICON_SRC = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABAC
 function IconFinder() {
   return <img src={FINDER_ICON_SRC} width={18} height={18} alt="" draggable={false} style={{ display: 'block', borderRadius: 4.5 }} />
 }
+// ---------- 浏览器/聊天图标（与既有 16px 线性风格一致） ----------
+function IconChatBubble() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <path d="M8 1.8c3.6 0 6.5 2.5 6.5 5.6s-2.9 5.6-6.5 5.6c-.7 0-1.4-.1-2-.3l-3.2 1.2c-.4.1-.7-.2-.6-.6l.7-2.6C1.9 9.7 1.5 8.6 1.5 7.4c0-3.1 2.9-5.6 6.5-5.6z" stroke="currentColor" strokeLinejoin="round" />
+      <path d="M5.2 7.5h.01M8 7.5h.01M10.8 7.5h.01" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  )
+}
+function IconArrowLeft() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <path d="M10 3.5 5.5 8l4.5 4.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+function IconArrowRight() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <path d="m6 3.5 4.5 4.5L6 12.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+function IconReload() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.75M13.2 1.8v2.9h-2.9" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+function IconExternal() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <path d="M7 3.5H4.1c-1 0-1.6.7-1.6 1.6v6.8c0 .9.7 1.6 1.6 1.6h6.8c.9 0 1.6-.7 1.6-1.6V9" stroke="currentColor" strokeLinecap="round" />
+      <path d="M9.5 2.5h4v4M13.2 2.8 8 8" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
 // ---------- 空状态（未打开任何文件时，预览区居中提示，同 Codex） ----------
 function EmptyState() {
   return (
@@ -851,6 +1109,16 @@ function FileTreePanel({ workspaces, sessions }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.activePath, state.files])
 
+  // 当前文件内容就绪 -> 写入聊天「引用当前文件」上下文（无激活文件/二进制时清空）
+  React.useEffect(() => {
+    const f = state.activePath ? state.files[state.activePath] : null
+    if (state.activePath && f && f.status === 'ok' && !f.binary && typeof f.content === 'string') {
+      setCurrentFileCtx({ path: state.activePath, content: f.content, truncated: !!f.truncated })
+    } else {
+      setCurrentFileCtx(null)
+    }
+  }, [state.activePath, state.files])
+
   // 树栏左缘拖拽调宽：120-320px
   const onTreeResizeStart = (e) => {
     e.preventDefault()
@@ -890,6 +1158,7 @@ function FileTreePanel({ workspaces, sessions }) {
   }
 
   const activeFile = state.activePath ? state.files[state.activePath] : null
+  const view = useContentView()
   const showSourceBtn = !!(state.activePath && isMdFile(baseName(state.activePath)) && activeFile && activeFile.status === 'ok' && !activeFile.binary)
   // ⧉ 打开 = 在系统文件管理器中打开文件所在文件夹（macOS：Finder）
   const dirOf = (p) => { const i = p.lastIndexOf('/'); return i <= 0 ? '/' : p.slice(0, i) }
@@ -910,43 +1179,289 @@ function FileTreePanel({ workspaces, sessions }) {
       fontFamily: V.font,
       fontSize: '13px'
     }}>
-      {/* 行1：页签（无文件时「打开文件」伪页签，× 收起面板）… ⤢ 加宽/还原（原生 360⇄520 上限） */}
-      <div style={{ display: 'flex', alignItems: 'center', minHeight: 56, borderBottom: '1px solid ' + V.line, flex: '0 0 auto', paddingRight: 6 }}>
-        <TabStrip state={state} dispatch={dispatch} onClose={onClose} />
+      {/* 行1：分段控件 [文件|浏览器] + 页签（文件视图）… ⤢ 加宽/还原（原生 360⇄520 上限） */}
+      <div style={{ display: 'flex', alignItems: 'center', minHeight: 56, borderBottom: '1px solid ' + V.line, flex: '0 0 auto', paddingRight: 6, paddingLeft: 8, gap: 8 }}>
+        <ContentSeg />
+        {view === 'files'
+          ? <TabStrip state={state} dispatch={dispatch} onClose={onClose} />
+          : <span style={{ flex: '1 1 auto' }} />}
         <div style={{ display: 'flex', alignItems: 'center', marginLeft: 'auto', flex: '0 0 auto' }}>
           <button type="button" onClick={toggleWide} data-tip={wide ? '恢复默认宽度' : '加宽面板（最大 520px）'} aria-label="切换加宽"
             className={'fsviewer-iconbtn fsviewer-tip' + (wide ? ' fsviewer-iconbtn--active' : '')}><IconMaximize /></button>
         </div>
       </div>
-      {/* 行2：面包屑 … 查看源代码 / 文件夹（收展树栏）/ 打开。右边距与行1一致，文件夹与 ⤢ 右缘对齐 */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 6px 4px 10px', borderBottom: '1px solid ' + V.line, flex: '0 0 auto' }}>
-        <span style={{ flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, color: V.muted }}>
-          {state.root ? baseName(state.root) : '…'}
-          {state.activePath ? <span><span style={{ color: V.edge }}> › </span><span style={{ color: V.fg }}>{baseName(state.activePath)}</span></span> : null}
-        </span>
-        {showSourceBtn
-          ? <button type="button" onClick={() => dispatch({ type: 'toggleSource' })} title="切换渲染/源码视图"
-            style={{ cursor: 'pointer', flex: '0 0 auto', height: 28, fontSize: 12, lineHeight: 1, padding: '0 10px', borderRadius: 6, border: '1px solid ' + V.line, background: state.sourceMode ? V.input : 'transparent', color: V.fg, display: 'inline-flex', alignItems: 'center' }}>
-            {state.sourceMode ? '渲染视图' : '查看源代码'}</button>
-          : null}
-        <button type="button" onClick={() => setTreeOn(!treeOn)} data-tip={treeOn ? '收起文件树' : '展开文件树'} aria-label="切换文件树"
-          className={'fsviewer-iconbtn fsviewer-tip' + (treeOn ? ' fsviewer-iconbtn--active' : '')}>
-          <IconFolder />
-        </button>
-        {state.activePath
-          ? <button type="button" onClick={openFolderInSystem} data-tip={openFolderTip} aria-label={openFolderTip}
-            className="fsviewer-tip"
-            style={{ cursor: 'pointer', flex: '0 0 auto', height: 28, fontSize: 12, lineHeight: 1, padding: '0 8px', borderRadius: 6, border: '1px solid ' + V.line, background: 'transparent', color: V.fg, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-            <IconFinder />打开</button>
-          : null}
+      {view === 'browser' ? (
+        <BrowserView />
+      ) : (
+        <>
+        {/* 行2：面包屑 … 查看源代码 / 文件夹（收展树栏）/ 打开。右边距与行1一致，文件夹与 ⤢ 右缘对齐 */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 6px 4px 10px', borderBottom: '1px solid ' + V.line, flex: '0 0 auto' }}>
+          <span style={{ flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, color: V.muted }}>
+            {state.root ? baseName(state.root) : '…'}
+            {state.activePath ? <span><span style={{ color: V.edge }}> › </span><span style={{ color: V.fg }}>{baseName(state.activePath)}</span></span> : null}
+          </span>
+          {showSourceBtn
+            ? <button type="button" onClick={() => dispatch({ type: 'toggleSource' })} title="切换渲染/源码视图"
+              style={{ cursor: 'pointer', flex: '0 0 auto', height: 28, fontSize: 12, lineHeight: 1, padding: '0 10px', borderRadius: 6, border: '1px solid ' + V.line, background: state.sourceMode ? V.input : 'transparent', color: V.fg, display: 'inline-flex', alignItems: 'center' }}>
+              {state.sourceMode ? '渲染视图' : '查看源代码'}</button>
+            : null}
+          <button type="button" onClick={() => setTreeOn(!treeOn)} data-tip={treeOn ? '收起文件树' : '展开文件树'} aria-label="切换文件树"
+            className={'fsviewer-iconbtn fsviewer-tip' + (treeOn ? ' fsviewer-iconbtn--active' : '')}>
+            <IconFolder />
+          </button>
+          {state.activePath
+            ? <button type="button" onClick={openFolderInSystem} data-tip={openFolderTip} aria-label={openFolderTip}
+              className="fsviewer-tip"
+              style={{ cursor: 'pointer', flex: '0 0 auto', height: 28, fontSize: 12, lineHeight: 1, padding: '0 8px', borderRadius: 6, border: '1px solid ' + V.line, background: 'transparent', color: V.fg, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+              <IconFinder />打开</button>
+            : null}
+        </div>
+        {/* 内容：左预览（无激活文件时空状态） | 右文件树栏（可拖拽调宽） */}
+        <div style={{ flex: '1 1 auto', display: 'flex', minHeight: 0 }}>
+          {state.activePath ? <FilePreview state={state} /> : <EmptyState />}
+          {treeOn ? <TreeColumn workspaces={workspaces} state={state} dispatch={dispatch} width={treeW} onResizeStart={onTreeResizeStart} /> : null}
+        </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+// ---------- 内容列分段控件 [文件 | 浏览器] ----------
+function ContentSeg() {
+  const view = useContentView()
+  return (
+    <div className="fsviewer-seg" role="tablist" aria-label="内容视图">
+      <button type="button" className={view === 'files' ? 'on' : ''} onClick={() => setContentView('files')}>文件</button>
+      <button type="button" className={view === 'browser' ? 'on' : ''} onClick={() => setContentView('browser')}>浏览器</button>
+    </div>
+  )
+}
+
+// ---------- 浏览器视图（URL 栏 + iframe；直连/代理双模式） ----------
+const BROWSER_KEY = 'fsviewer/browser.v1'
+// 输入归一化：补协议；域名样式的补 https；localhost 补 http；其余当搜索词
+function normalizeUrl(raw) {
+  const s = String(raw || '').trim()
+  if (!s) return null
+  if (/^https?:\/\//i.test(s)) return s
+  if (/^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?([/?#].*)?$/i.test(s)) return 'http://' + s
+  if (/^[a-z0-9][a-z0-9.-]*(\.[a-z0-9-]+)+(:\d+)?([/?#].*)?$/i.test(s)) return 'https://' + s
+  return 'https://www.bing.com/search?q=' + encodeURIComponent(s)
+}
+function loadBrowserState() {
+  let url = null
+  let proxy = false
+  try {
+    const d = JSON.parse(localStorage.getItem(BROWSER_KEY) || 'null')
+    if (d && typeof d.url === 'string' && d.url) { url = d.url; proxy = !!d.proxy }
+  } catch { /* 忽略 */ }
+  return { url, input: url || '', proxy, hist: [], idx: -1, reload: 0 }
+}
+function BrowserView() {
+  const [st, setSt] = React.useState(loadBrowserState)
+  const persist = (next) => {
+    try { localStorage.setItem(BROWSER_KEY, JSON.stringify({ url: next.url, proxy: next.proxy })) } catch { /* 忽略 */ }
+  }
+  const navigate = (raw) => {
+    const url = normalizeUrl(raw)
+    if (!url) return
+    setSt((s) => {
+      const hist = s.hist.slice(0, s.idx + 1).concat(url)
+      const next = { ...s, url, input: url, hist, idx: hist.length - 1 }
+      persist(next)
+      return next
+    })
+  }
+  const go = (delta) => setSt((s) => {
+    const idx = s.idx + delta
+    if (idx < 0 || idx >= s.hist.length) return s
+    const next = { ...s, idx, url: s.hist[idx], input: s.hist[idx] }
+    persist(next)
+    return next
+  })
+  const toggleProxy = () => setSt((s) => {
+    const next = { ...s, proxy: !s.proxy, reload: s.reload + 1 }
+    persist(next)
+    return next
+  })
+  const reload = () => setSt((s) => ({ ...s, reload: s.reload + 1 }))
+  const openExternal = () => { if (st.url) window.open(st.url, '_blank', 'noopener') }
+  const src = st.url ? (st.proxy ? '/fsviewer-api/p/' + st.url : st.url) : 'about:blank'
+  return (
+    <div style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+      {/* URL 行：← → ⟳ 地址栏 [代理] ⧉ */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '4px 6px 4px 8px', borderBottom: '1px solid ' + V.line, flex: '0 0 auto' }}>
+        <button type="button" onClick={() => go(-1)} disabled={st.idx <= 0} data-tip="后退" aria-label="后退"
+          className="fsviewer-iconbtn fsviewer-tip" style={{ opacity: st.idx <= 0 ? 0.4 : 1 }}><IconArrowLeft /></button>
+        <button type="button" onClick={() => go(1)} disabled={st.idx >= st.hist.length - 1} data-tip="前进" aria-label="前进"
+          className="fsviewer-iconbtn fsviewer-tip" style={{ opacity: st.idx >= st.hist.length - 1 ? 0.4 : 1 }}><IconArrowRight /></button>
+        <button type="button" onClick={reload} data-tip="重新加载" aria-label="重新加载" className="fsviewer-iconbtn fsviewer-tip"><IconReload /></button>
+        <input type="text" placeholder="输入网址或搜索词，回车打开" value={st.input} spellCheck={false}
+          onChange={(e) => setSt((s) => ({ ...s, input: e.target.value }))}
+          onKeyDown={(e) => { if (e.key === 'Enter') navigate(e.currentTarget.value) }}
+          style={{ flex: '1 1 auto', minWidth: 0, boxSizing: 'border-box', padding: '5px 8px', backgroundColor: V.input, border: '1px solid ' + V.line, borderRadius: 6, color: V.fg, fontSize: 12 }} />
+        <button type="button" onClick={toggleProxy} data-tip={st.proxy ? '代理模式：经主机同源回源（绕过 X-Frame-Options）' : '直连模式：部分站点会拒绝被嵌入，可切代理'}
+          aria-label="切换代理模式"
+          className={'fsviewer-tip' + (st.proxy ? ' fsviewer-chat-quote on' : ' fsviewer-chat-quote')}>{st.proxy ? '代理' : '直连'}</button>
+        <button type="button" onClick={openExternal} disabled={!st.url} data-tip="在新窗口打开" aria-label="在新窗口打开"
+          className="fsviewer-iconbtn fsviewer-tip" style={{ opacity: st.url ? 1 : 0.4 }}><IconExternal /></button>
       </div>
-      {/* 内容：左预览（无激活文件时空状态） | 右文件树栏（可拖拽调宽） */}
-      <div style={{ flex: '1 1 auto', display: 'flex', minHeight: 0 }}>
-        {state.activePath ? <FilePreview state={state} /> : <EmptyState />}
-        {treeOn ? <TreeColumn workspaces={workspaces} state={state} dispatch={dispatch} width={treeW} onResizeStart={onTreeResizeStart} /> : null}
+      {/* 页面：一律沙箱（无 allow-same-origin / top 导航，页面 JS 无法触碰本应用） */}
+      <iframe
+        key={src + '#' + st.reload}
+        src={src}
+        title="浏览器"
+        sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"
+        style={{ flex: '1 1 auto', width: '100%', border: 'none', minHeight: 0, backgroundColor: '#fff' }} />
+    </div>
+  )
+}
+
+// ---------- 侧边聊天：会话头入口按钮（文件按钮右侧，order 51） ----------
+function ChatToggleButton() {
+  const open = useChatOpen()
+  return (
+    <button
+      type="button"
+      aria-label="侧边聊天"
+      title="侧边聊天（⌥⌘S）"
+      className={'fsviewer-toggle' + (open ? ' fsviewer-toggle--active' : '')}
+      onClick={toggleChat}
+    >
+      <IconChatBubble />
+    </button>
+  )
+}
+
+// ---------- 侧边聊天：停靠面板（shell.overlay 槽位，右缘 380px 全高） ----------
+function ChatMessage({ m }) {
+  if (m.role === 'user') return <div className="fsviewer-chat-user">{m.content}</div>
+  const waiting = m.streaming && !m.content && !m.error
+  return (
+    <div className="fsviewer-chat-ai">
+      {waiting
+        ? <span style={{ color: V.muted, fontSize: 12 }}>{m.reasoning ? '思考中…' : '…'}</span>
+        : (m.content ? <MarkdownText text={m.content} streaming={!!m.streaming} /> : null)}
+      {m.note ? <div style={{ marginTop: 4, fontSize: 11, color: V.muted }}>ⓘ {m.note}</div> : null}
+      {m.error ? <div style={{ marginTop: 4, fontSize: 12, color: '#e06c75' }}>⚠ {m.error}</div> : null}
+    </div>
+  )
+}
+function ChatPanel() {
+  hydrateChat()
+  const [, force] = React.useState()
+  React.useEffect(() => subscribeChat(() => force({})), [])
+  const fileCtx = useCurrentFileCtx()
+  const [quote, setQuote] = React.useState(false)
+  const [text, setText] = React.useState('')
+  const endRef = React.useRef(null)
+  // 消息尾部增长时贴底滚动（新消息/增量都触发）
+  const tail = chatStore.messages[chatStore.messages.length - 1]
+  const tailLen = tail ? tail.content.length + (tail.reasoning ? tail.reasoning.length : 0) : 0
+  React.useEffect(() => {
+    const el = endRef.current
+    if (el) el.scrollIntoView({ block: 'end' })
+  }, [chatStore.messages.length, tailLen, chatStore.streaming])
+  const submit = () => {
+    const t = text
+    if (!t.trim() || chatStore.streaming) return
+    setText('')
+    const quoted = quote && fileCtx && !fileCtx.binary
+      ? { path: fileCtx.path, content: fileCtx.content, truncated: fileCtx.truncated }
+      : null
+    if (quote) setQuote(false)
+    sendChat(t, quoted)
+  }
+  return (
+    <div className="fsviewer-chat-panel" style={{ fontFamily: V.font }}>
+      {/* 头：标题 + 模型路由 + 清空 + 关闭 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 8px 10px 14px', borderBottom: '1px solid ' + V.line, flex: '0 0 auto' }}>
+        <span style={{ fontSize: 13, fontWeight: 600, color: V.fg }}>侧边聊天</span>
+        {chatStore.route
+          ? <span title={chatStore.route.provider + ' / ' + chatStore.route.model}
+            style={{ fontSize: 11, color: V.muted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: '1 1 auto', minWidth: 0 }}>
+            {chatStore.route.model}</span>
+          : <span style={{ flex: '1 1 auto' }} />}
+        <button type="button" onClick={clearChat} className="fsviewer-iconbtn fsviewer-tip" data-tip="清空对话" aria-label="清空对话"
+          style={{ width: 28, height: 28, fontSize: 15, lineHeight: 1 }}>⌫</button>
+        <button type="button" onClick={closeChat} className="fsviewer-iconbtn fsviewer-tip" data-tip="关闭（⌥⌘S）" aria-label="关闭侧边聊天"
+          style={{ width: 28, height: 28, fontSize: 15, lineHeight: 1 }}>×</button>
+      </div>
+      {/* 消息列表 */}
+      <div className="fsviewer-chat-scroll">
+        {chatStore.messages.length === 0
+          ? (
+            <div style={{ margin: 'auto', textAlign: 'center', color: V.muted, fontSize: 12, display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'center' }}>
+              <IconChatBubble />
+              <div>向模型提问，可引用当前查看的文件</div>
+              <div style={{ fontSize: 11 }}>⌥⌘S 开合 · 直连 dsh 已配置的模型</div>
+            </div>
+          )
+          : chatStore.messages.map((m, i) => <ChatMessage key={i} m={m} />)}
+        <div ref={endRef} />
+      </div>
+      {/* 引用当前文件 + 输入区 */}
+      <div style={{ borderTop: '1px solid ' + V.line, padding: '8px 10px 10px', flex: '0 0 auto', display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {fileCtx
+          ? (
+            <button type="button" className={'fsviewer-chat-quote' + (quote ? ' on' : '')}
+              title={'引用文件内容作为上下文：' + fileCtx.path}
+              onClick={() => setQuote(!quote)}>
+              📎 引用当前文件：{baseName(fileCtx.path)}{fileCtx.truncated ? '（前 1MB）' : ''}
+            </button>
+          )
+          : null}
+        <div style={{ display: 'flex', alignItems: 'flex-end', gap: 6 }}>
+          <textarea
+            value={text}
+            rows={2}
+            placeholder="输入消息，Enter 发送，Shift+Enter 换行"
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                e.preventDefault()
+                submit()
+              }
+            }}
+            style={{ flex: '1 1 auto', minWidth: 0, resize: 'none', boxSizing: 'border-box', padding: '7px 9px', backgroundColor: V.input, border: '1px solid ' + V.line, borderRadius: 8, color: V.fg, fontSize: 13, lineHeight: 1.45, fontFamily: V.font }}
+          />
+          {chatStore.streaming
+            ? <button type="button" onClick={stopChat} title="停止生成"
+              style={{ cursor: 'pointer', flex: '0 0 auto', height: 32, fontSize: 12, padding: '0 12px', borderRadius: 8, border: '1px solid ' + V.line, background: 'transparent', color: V.fg }}>停止</button>
+            : <button type="button" onClick={submit} disabled={!text.trim()} title="发送"
+              style={{ cursor: text.trim() ? 'pointer' : 'default', flex: '0 0 auto', height: 32, fontSize: 12, padding: '0 12px', borderRadius: 8, border: '1px solid ' + V.line, background: text.trim() ? 'var(--dsw-alias-interactive-bg-active)' : 'transparent', color: V.fg, opacity: text.trim() ? 1 : 0.5 }}>发送</button>}
+        </div>
       </div>
     </div>
   )
+}
+function ChatOverlay() {
+  const open = useChatOpen()
+  if (!open) return null
+  return (
+    <PanelErrorBoundary>
+      <ChatPanel />
+    </PanelErrorBoundary>
+  )
+}
+
+// ---------- 快捷键（dsh 无原生快捷键注册 API，自行 DOM 监听） ----------
+// 用 e.code 而非 e.key：macOS ⌥ 组合会把 key 变成特殊字符（⌥S -> 'ß'）。
+// ⌥⌘S 开合侧边聊天（与 Codex 一致）；⌥⌘T 内容列切浏览器并展开（⌘T 留给浏览器本体）。
+function installShortcuts() {
+  if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return
+  window.addEventListener('keydown', (e) => {
+    if (!e.metaKey || !e.altKey || e.ctrlKey || e.shiftKey) return
+    if (e.code === 'KeyS') {
+      e.preventDefault()
+      toggleChat()
+    } else if (e.code === 'KeyT') {
+      e.preventDefault()
+      setContentView('browser')
+      openPanelWithRoom()
+    }
+  })
 }
 
 // ---------- 插件契约 ----------
@@ -984,6 +1499,13 @@ export function apply(ctx) {
       (props) => React.createElement(FsToggleButton, props)
     )
   )
+  // 聊天入口按钮：文件按钮右侧（order 更大）
+  ctx.slots.inject('conversation.session.header.utilities', () =>
+    ctx.slots.register(
+      { name: 'conversation.session.header.utilities', id: 'fsviewer-chat-toggle', order: 51, label: '侧边聊天' },
+      (props) => React.createElement(ChatToggleButton, props)
+    )
+  )
   // 文件面板：直接接管原生 details 右栏（影子注册）。single 槽位同优先级冲突，
   // 不同优先级影子共存——conversation 的工具详情面板未传 priority（=0），
   // 本插件用 -10（更低者优先渲染）接管该栏；本插件停用后原生工具详情自动恢复。
@@ -997,5 +1519,14 @@ export function apply(ctx) {
       )
     )
   )
-  console.log('[fsviewer] Client plugin loaded (native details column takeover: preview + tree)')
+  // 侧边聊天：原生 shell.overlay 全帧浮层（additive 槽位，层点击穿透、条目自行
+  // 接管指针）。右缘 380px 停靠面板，与 details 内容列互斥占用右缘。
+  ctx.slots.inject('shell.overlay', () =>
+    ctx.slots.register(
+      { name: 'shell.overlay', id: 'fsviewer-chat', order: 10, label: '侧边聊天' },
+      (props) => React.createElement(ChatOverlay, props)
+    )
+  )
+  installShortcuts()
+  console.log('[fsviewer] Client plugin loaded (details takeover: 文件/浏览器 views + shell.overlay 侧边聊天)')
 }

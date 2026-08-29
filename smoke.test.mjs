@@ -60,14 +60,19 @@ const stubCtx = {
 }
 exports.apply(stubCtx)
 
-if (registrations.length !== 2) throw new Error('expected exactly 2 slot registrations, got ' + registrations.length)
-const utilReg = registrations.find((r) => r.meta.name === 'conversation.session.header.utilities')
+if (registrations.length !== 4) throw new Error('expected exactly 4 slot registrations, got ' + registrations.length)
+const utilReg = registrations.find((r) => r.meta.name === 'conversation.session.header.utilities' && r.meta.id === 'fsviewer-toggle')
+const chatToggleReg = registrations.find((r) => r.meta.name === 'conversation.session.header.utilities' && r.meta.id === 'fsviewer-chat-toggle')
 const detailsReg = registrations.find((r) => r.meta.name === 'details')
 if (!utilReg) throw new Error('missing utilities registration')
 if (utilReg.meta.id !== 'fsviewer-toggle') throw new Error('wrong utilities id: ' + utilReg.meta.id)
-if (!detailsReg) throw new Error('missing details registration')
-if (detailsReg.meta.id !== 'fsviewer-panel') throw new Error('wrong details id: ' + detailsReg.meta.id)
-if (detailsReg.meta.priority !== -10) throw new Error('details priority should be -10 (shadow conversation), got ' + detailsReg.meta.priority)
+if (!chatToggleReg) throw new Error('missing chat toggle registration')
+if (detailsReg) {
+  if (detailsReg.meta.id !== 'fsviewer-panel') throw new Error('wrong details id: ' + detailsReg.meta.id)
+  if (detailsReg.meta.priority !== -10) throw new Error('details priority should be -10 (shadow conversation), got ' + detailsReg.meta.priority)
+} else throw new Error('missing details registration')
+const overlayReg = registrations.find((r) => r.meta.name === 'shell.overlay' && r.meta.id === 'fsviewer-chat')
+if (!overlayReg) throw new Error('missing shell.overlay chat registration')
 const reg = detailsReg
 if (!reg.comp || !reg.comp.element) throw new Error('component factory returned unexpected value')
 
@@ -126,3 +131,11 @@ const resDir = mkRes()
 await routeHandler({ method: 'GET', url: '/fsviewer-api/file?path=' + encodeURIComponent(new URL('.', import.meta.url).pathname) }, resDir)
 if (resDir.code !== 400) throw new Error('dir read should 400: ' + resDir.body)
 console.log('  host routes: /fsviewer-api/list + /fsviewer-api/file OK')
+
+// chat 端点：宿主未提供 ctx.llm 时应 503 JSON（而非崩溃/非 JSON 响应）
+const resChat = mkRes()
+await routeHandler({ method: 'POST', url: '/fsviewer-api/chat' }, resChat)
+if (resChat.code !== 503) throw new Error('chat without llm should 503, got ' + resChat.code + ': ' + resChat.body)
+const chatErr = JSON.parse(resChat.body)
+if (!chatErr.error) throw new Error('chat 503 body missing error: ' + resChat.body)
+console.log('  host route: POST /fsviewer-api/chat (llm missing -> 503) OK')
