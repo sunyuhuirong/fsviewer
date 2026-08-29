@@ -57,18 +57,81 @@ function sidebarRenderedWidth() {
 // 右栏展开前调用：左栏展开着、且按当前宽度右栏会被挤到最小宽以下时，
 // 先收起左栏（原生 toggleSidebar 在 >1024 视口写偏好 0，收起为图标栏）。
 // 只在左栏确实处于展开态时触发——收起态（56 图标栏）下再 toggle 会把它展开，反了。
+// 返回收拢后的左栏有效宽度（供挤压判定使用，避免读到未刷新的 DOM）。
 function ensureRoomForDetails() {
-  if (!layoutApi) return
+  if (!layoutApi) return sidebarRenderedWidth()
   const sidebarW = sidebarRenderedWidth()
   if (sidebarW > SIDEBAR_RAIL_PX + 8 &&
       window.innerWidth - sidebarW - CENTER_MIN_PX < DETAILS_MIN_PX) {
     layoutApi.toggleSidebar()
+    return SIDEBAR_RAIL_PX
+  }
+  return sidebarW
+}
+
+// ---------- 极小窗口的挤压展开 ----------
+// 原生让位链在 V ≤ 696（左栏已收成图标栏）时仍会把 details 算成 0 宽——点开无效果。
+// 此时用与 ⤢ 相同的 CSS 覆盖把右栏钉在可用宽度（280-360px），center 段是 1fr
+// 弹性轨道、自然吸收挤压；窗口变大到原生放得下（≥300）后自动解除覆盖。
+let pinMode = null          // null | 'wide'（⤢ 用户选择，不自动解除）| 'squeeze'（小窗口挤压，自动解除）
+let panelResizeWatch = null
+function stopPanelResizeWatch() {
+  if (panelResizeWatch) { window.removeEventListener('resize', panelResizeWatch); panelResizeWatch = null }
+}
+// 面板打开期间常驻：窗口尺寸变化时双向调度——原生被饿（<300 或 0）就钉挤压宽度，
+// 原生放得下就解除覆盖交还（⤢ 的 520 是用户选择，不动）。
+function startPanelResizeWatch() {
+  stopPanelResizeWatch()
+  panelResizeWatch = () => {
+    if (!panelOpen || pinMode === 'wide') return
+    const nativeFits = window.innerWidth - sidebarRenderedWidth() - CENTER_MIN_PX >= DETAILS_MIN_PX
+    if (pinMode === 'squeeze') {
+      if (nativeFits) tryReleaseSqueeze()
+      else applySqueezeIfNeeded(sidebarRenderedWidth())  // 跟随窗口尺寸重算挤压宽度
+    } else if (!nativeFits) {
+      applySqueezeIfNeeded(sidebarRenderedWidth())
+    }
+  }
+  window.addEventListener('resize', panelResizeWatch)
+}
+// 试探-回退式解除：resize 瞬间 sidebar 内联可能还是旧值（如 narrow 退出前仍是 56 图标栏），
+// 误判「原生放得下」就解除会让原生把 details 关成 0（details 契约是 ≥300 或 0，无中间态），
+// 面板凭空消失。故解除后延迟验证 detailsCol 实际宽度，原生没接住就重新钉上。
+function tryReleaseSqueeze() {
+  pinMode = null
+  setFramePin(null)
+  setTimeout(() => {
+    if (pinMode !== null || !panelOpen) return  // 期间用户已 ⤢ 等其他操作，不回退
+    const col = document.querySelector('[class*="detailsCol"]')
+    const w = col ? col.getBoundingClientRect().width : 0
+    if (w < 280) applySqueezeIfNeeded(sidebarRenderedWidth())
+  }, 300)
+}
+// sidebarW = 收拢后的左栏有效宽度。原生已放得下则什么都不做。
+function applySqueezeIfNeeded(sidebarW) {
+  // 窄视口（<1024，原生自动收栏断点）下左栏必渲染成 56 图标栏；resize 瞬间
+  // 读到的可能是旧展开宽度，按断点校正，避免挤压宽度算小
+  const effW = window.innerWidth >= 1024 ? sidebarW : Math.min(sidebarW, SIDEBAR_RAIL_PX)
+  const fitsNatively = window.innerWidth - effW - CENTER_MIN_PX >= DETAILS_MIN_PX
+  if (!fitsNatively) {
+    if (pinMode === 'wide') return  // ⤢ 已钉 520，比挤压更宽，不覆盖用户选择
+    pinMode = 'squeeze'
+    // 目标宽度：优先 360（默认宽），窗口太窄时给右栏留 360 可读聊天区，下限 280
+    setFramePin(Math.max(280, Math.min(360, window.innerWidth - effW - 360)))
+  } else if (pinMode === 'squeeze') {
+    pinMode = null
+    setFramePin(null)
   }
 }
-function openFileInPanel(path) {
+function openPanelWithRoom() {
   setPanelOpen(true)
-  ensureRoomForDetails()
+  const sidebarW = ensureRoomForDetails()
   if (layoutApi) layoutApi.openDetails()
+  applySqueezeIfNeeded(sidebarW)
+  startPanelResizeWatch()
+}
+function openFileInPanel(path) {
+  openPanelWithRoom()
   if (panelFileDispatch) panelFileDispatch(path)
   else if (nativeOpenPath) nativeOpenPath(path)
 }
@@ -84,16 +147,16 @@ function usePanelOpen() {
 }
 function togglePanel() {
   if (panelOpen) { closePanel(); return }
-  setPanelOpen(true)
-  ensureRoomForDetails()
-  if (layoutApi) layoutApi.openDetails()
+  openPanelWithRoom()
 }
 function closePanel() {
   if (!panelOpen) return
   setPanelOpen(false)
-  // 收起时解除 ⤢ 展开覆盖，恢复原生宽度
+  // 收起时解除所有宽度覆盖（⤢ 加宽 / 小窗挤压），恢复原生宽度
   wideOn = false
-  setExpandedFrame(false)
+  pinMode = null
+  stopPanelResizeWatch()
+  setFramePin(null)
   if (layoutApi) layoutApi.closeDetails()
 }
 
@@ -148,26 +211,27 @@ function injectToggleStyle() {
 const TREE_DEFAULT_WIDTH = 150
 let treeWidth = TREE_DEFAULT_WIDTH
 const Z_TRIGGER = 301
-// ⤢ 展开：覆盖 AppFrame 网格列宽（!important 压过内联样式），把右栏加宽到原生上限 520
+// ⤢ 展开：覆盖 AppFrame 网格列宽（!important 压过内联样式）；
+// 极小窗口挤压展开复用同一机制，只是钉的宽度不同。
 const EXPAND_CLASS = 'fsv-expanded-frame'
 let wideOn = false
 let frameStyleObserver = null
-// 展开：钉住网格的 details 段为 520px；sidebar/center 段镜像 React 的最新内联值
-// （否则收起左侧边栏时 sidebar 段被冻结成旧宽度，聊天区不跟随挤压）。
-// 用 MutationObserver 监听 AppFrame 内联网格变化并同步 --fsv-grid；
-// 带去重守卫防止自身写入触发死循环。
-function setExpandedFrame(on) {
+// 钉住网格的 details 段为指定宽度（px=null 解除）；sidebar/center 段镜像 React 的
+// 最新内联值（center 是 minmax(0,1fr) 弹性轨道，自然吸收挤压；否则收起左侧边栏时
+// sidebar 段会被冻结成旧宽度）。用 MutationObserver 监听 AppFrame 内联网格变化并
+// 同步 --fsv-grid；带去重守卫防止自身写入触发死循环。
+function setFramePin(px) {
   const col = document.querySelector('[class*="detailsCol"]')
   const frame = col && col.parentElement
   if (!frame) return
-  if (on) {
+  if (px != null) {
     let last = ''
     const sync = () => {
       const inline = frame.style.gridTemplateColumns
       if (!inline) return
       const parts = inline.split(' ')
       if (parts.length < 3) return
-      parts[parts.length - 1] = '520px'
+      parts[parts.length - 1] = px + 'px'
       const next = parts.join(' ')
       if (next !== last) {
         last = next
@@ -176,6 +240,7 @@ function setExpandedFrame(on) {
     }
     sync()
     frame.classList.add(EXPAND_CLASS)
+    if (frameStyleObserver) frameStyleObserver.disconnect()
     frameStyleObserver = new MutationObserver(sync)
     frameStyleObserver.observe(frame, { attributes: true, attributeFilter: ['style'] })
   } else {
@@ -789,7 +854,16 @@ function FileTreePanel({ workspaces, sessions }) {
   const toggleWide = () => {
     wideOn = !wideOn
     setWide(wideOn)
-    setExpandedFrame(wideOn)
+    if (wideOn) {
+      pinMode = 'wide'
+      setFramePin(520)
+      return
+    }
+    // 还原：若极小窗口挤压仍在生效则回到挤压宽度，否则完全交还原生
+    pinMode = null
+    const sidebarW = sidebarRenderedWidth()
+    if (window.innerWidth - sidebarW - CENTER_MIN_PX < DETAILS_MIN_PX) applySqueezeIfNeeded(sidebarW)
+    else setFramePin(null)
   }
 
   const activeFile = state.activePath ? state.files[state.activePath] : null
