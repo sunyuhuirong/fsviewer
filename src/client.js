@@ -102,8 +102,8 @@ function injectToggleStyle() {
     '.fsviewer-badge{flex:0 0 auto;display:inline-flex;justify-content:center;align-items:center;' +
     'width:20px;height:14px;border-radius:3px;font-size:8px;font-weight:700;margin-right:4px;' +
     'color:#fff;mix-blend-mode:normal}' +
-    '.fsviewer-tab{flex:0 0 auto;display:inline-flex;align-items:center;gap:4px;max-width:120px;' +
-    'padding:2px 6px;border-radius:6px;font-size:11px;cursor:pointer;color:var(--dsw-alias-label-secondary);' +
+    '.fsviewer-tab{flex:0 0 auto;display:inline-flex;align-items:center;gap:5px;max-width:150px;' +
+    'padding:7px 10px;border-radius:8px;font-size:12px;cursor:pointer;color:var(--dsw-alias-label-secondary);' +
     'background:var(--dsw-alias-interactive-bg-hover);white-space:nowrap}' +
     '.fsviewer-tab--active{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-active)}' +
     '.fsv-expanded-frame{grid-template-columns:var(--fsv-grid, 280px minmax(0,1fr) 360px) !important}' +
@@ -120,18 +120,37 @@ const Z_TRIGGER = 301
 // ⤢ 展开：覆盖 AppFrame 网格列宽（!important 压过内联样式），把右栏加宽到原生上限 520
 const EXPAND_CLASS = 'fsv-expanded-frame'
 let wideOn = false
+let frameStyleObserver = null
+// 展开：钉住网格的 details 段为 520px；sidebar/center 段镜像 React 的最新内联值
+// （否则收起左侧边栏时 sidebar 段被冻结成旧宽度，聊天区不跟随挤压）。
+// 用 MutationObserver 监听 AppFrame 内联网格变化并同步 --fsv-grid；
+// 带去重守卫防止自身写入触发死循环。
 function setExpandedFrame(on) {
   const col = document.querySelector('[class*="detailsCol"]')
   const frame = col && col.parentElement
   if (!frame) return
   if (on) {
-    const cur = frame.style.gridTemplateColumns || getComputedStyle(frame).gridTemplateColumns
-    const parts = cur.split(' ')
-    if (parts.length >= 3) parts[parts.length - 1] = '520px'
-    frame.style.setProperty('--fsv-grid', parts.join(' '))
+    let last = ''
+    const sync = () => {
+      const inline = frame.style.gridTemplateColumns
+      if (!inline) return
+      const parts = inline.split(' ')
+      if (parts.length < 3) return
+      parts[parts.length - 1] = '520px'
+      const next = parts.join(' ')
+      if (next !== last) {
+        last = next
+        frame.style.setProperty('--fsv-grid', next)
+      }
+    }
+    sync()
     frame.classList.add(EXPAND_CLASS)
+    frameStyleObserver = new MutationObserver(sync)
+    frameStyleObserver.observe(frame, { attributes: true, attributeFilter: ['style'] })
   } else {
+    if (frameStyleObserver) { frameStyleObserver.disconnect(); frameStyleObserver = null }
     frame.classList.remove(EXPAND_CLASS)
+    frame.style.removeProperty('--fsv-grid')
   }
 }
 // 颜色全部走宿主主题变量，明暗主题自动适配
@@ -763,8 +782,8 @@ function FileTreePanel({ workspaces, sessions }) {
             className={'fsviewer-iconbtn' + (wide ? ' fsviewer-iconbtn--active' : '')}><IconMaximize /></button>
         </div>
       </div>
-      {/* 行2：面包屑 … 查看源代码 / 文件夹（收展树栏）/ 打开 */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '5px 20px 5px 10px', borderBottom: '1px solid ' + V.line, flex: '0 0 auto' }}>
+      {/* 行2：面包屑 … 查看源代码 / 文件夹（收展树栏）/ 打开。右边距与行1一致，文件夹与 ⤢ 右缘对齐 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 6px 4px 10px', borderBottom: '1px solid ' + V.line, flex: '0 0 auto' }}>
         <span style={{ flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, color: V.muted }}>
           {state.root ? baseName(state.root) : '…'}
           {state.activePath ? <span><span style={{ color: V.edge }}> › </span><span style={{ color: V.fg }}>{baseName(state.activePath)}</span></span> : null}
