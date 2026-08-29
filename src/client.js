@@ -548,6 +548,21 @@ function IconFolder() {
     </svg>
   )
 }
+// ---------- Finder 风格图标（⧉ 打开按钮）：白色圆角方块 + 笑脸中缝，
+// 特征线用 var(--fsv-finder-ink, #3b82f6) 描——按钮内通过 CSS 变量透出底色 ---------- */
+function IconFinder() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <rect x="1" y="1" width="14" height="14" rx="3.5" fill="#fff" />
+      <g stroke="var(--fsv-finder-ink, #3b82f6)" strokeWidth="1.3" strokeLinecap="round" fill="none">
+        <path d="M8 1v14" />
+        <path d="M5.1 4.9v2.2" />
+        <path d="M10.9 4.9v2.2" />
+        <path d="M4.6 9.6c1 1.2 2.1 1.8 3.4 1.8s2.4-.6 3.4-1.8" />
+      </g>
+    </svg>
+  )
+}
 // ---------- 空状态（未打开任何文件时，预览区居中提示，同 Codex） ----------
 function EmptyState() {
   return (
@@ -924,8 +939,8 @@ function FileTreePanel({ workspaces, sessions }) {
         </button>
         {state.activePath
           ? <button type="button" onClick={openFolderInSystem} title={openFolderTip} aria-label={openFolderTip}
-            style={{ cursor: 'pointer', flex: '0 0 auto', fontSize: 12, padding: '3px 12px', borderRadius: 6, border: 'none', background: V.accent, color: '#fff' }}>
-            ⧉ 打开</button>
+            style={{ cursor: 'pointer', flex: '0 0 auto', fontSize: 12, padding: '3px 12px', borderRadius: 6, border: 'none', background: V.accent, color: '#fff', display: 'inline-flex', alignItems: 'center', gap: 5, '--fsv-finder-ink': V.accent }}>
+            <IconFinder />打开</button>
           : null}
       </div>
       {/* 内容：左预览（无激活文件时空状态） | 右文件树栏（可拖拽调宽） */}
