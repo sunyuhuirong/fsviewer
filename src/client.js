@@ -144,6 +144,24 @@ function openFileTab(path) {
   activeTabId = t.id
   persistTabs(); notifyTabs()
 }
+// 「打开文件」页签下双击文件：该页签原地替换为文件页签（不新增页签，Codex 首开语义）。
+// 若该文件已有独立页签，则移除 files 页签并聚焦已有页签。
+function replaceFilesTabWithFile(path) {
+  const idx = tabs.findIndex((t) => t.kind === 'files')
+  if (idx < 0) return openFileTab(path)
+  const existing = tabs.find((t) => t.kind === 'file' && t.path === path)
+  tabs = tabs.filter((t) => t.kind !== 'files')
+  if (existing) {
+    activeTabId = existing.id
+  } else {
+    const tab = { id: mkId('f'), kind: 'file', path }
+    // 原位插入到 files 页签原来的位置
+    const at = Math.min(idx, tabs.length)
+    tabs = tabs.slice(0, at).concat(tab, tabs.slice(at))
+    activeTabId = tab.id
+  }
+  persistTabs(); notifyTabs()
+}
 function newBrowserTab() {
   const id = mkId('b')
   browserById[id] = { title: '新标签页', url: null, input: '', proxy: false, hist: [], idx: -1, reload: 0 }
@@ -764,12 +782,17 @@ function DirRow({ entry, depth, expanded, loading, onToggle }) {
   )
 }
 
-// ---------- 文件行（彩色类型徽章；点击打开预览；激活文件高亮） ----------
-function FileRow({ entry, depth, active, onOpen }) {
+// ---------- 文件行（彩色类型徽章；激活高亮） ----------
+// 手势按当前页签类型区分（Codex 语义）：
+//   打开文件页签：双击打开（原地替换为文件页签），单击仅选中
+//   文件页签：单击即新建/聚焦该文件的独立页签（双击同义）
+function FileRow({ entry, depth, active, tabKind, onActivate, onOpen }) {
   const badge = fileBadge(entry.name)
   return (
     <div className="fsviewer-row" style={{ paddingLeft: 20 + depth * 14, ...(active ? { backgroundColor: 'var(--dsw-alias-interactive-bg-active)' } : null) }}
-      onClick={onOpen} title={entry.path}>
+      onClick={tabKind === 'file' ? onActivate : undefined}
+      onDoubleClick={onOpen}
+      title={tabKind === 'files' ? '双击打开 ' + entry.name : entry.path}>
       <span className="fsviewer-badge" style={{ backgroundColor: badge.color }}>{badge.text}</span>
       <span style={{ flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', paddingRight: 4 }}>{entry.name}</span>
     </div>
@@ -896,7 +919,7 @@ function EmptyState() {
         <path d="M1.5 4.2c0-.9.7-1.6 1.6-1.6h2.8l1.6 1.8h5.4c.9 0 1.6.7 1.6 1.6v5.8c0 .9-.7 1.6-1.6 1.6H3.1c-.9 0-1.6-.7-1.6-1.6V4.2z" stroke="currentColor" strokeLinejoin="round" />
       </svg>
       <div style={{ fontSize: 15, fontWeight: 600, color: V.fg }}>打开文件</div>
-      <div style={{ fontSize: 12 }}>从工作区目录树中选择文件</div>
+      <div style={{ fontSize: 12 }}>双击目录树中的文件打开</div>
     </div>
   )
 }
@@ -948,7 +971,7 @@ function FilePreview({ state }) {
 }
 
 // ---------- 文件树栏（右侧窄栏：筛选 + 目录文件树；左缘可拖拽调宽） ----------
-function TreeColumn({ workspaces, state, dispatch, width, onResizeStart }) {
+function TreeColumn({ workspaces, state, dispatch, width, onResizeStart, tabKind }) {
   function entryMatchesDeep(entry) {
     if (matches(state.term, entry.name)) return true
     if (entry.type !== 'directory') return false
@@ -964,9 +987,10 @@ function TreeColumn({ workspaces, state, dispatch, width, onResizeStart }) {
     return filterEntries(entries).map((entry) => {
       if (entry.type !== 'directory') {
         return (
-          <FileRow key={entry.path} entry={entry} depth={depth}
+          <FileRow key={entry.path} entry={entry} depth={depth} tabKind={tabKind}
             active={entry.path === state.activePath}
-            onOpen={() => openFileInPanel(entry.path)} />
+            onActivate={() => openFileTab(entry.path)}
+            onOpen={() => (tabKind === 'files' ? replaceFilesTabWithFile(entry.path) : openFileTab(entry.path))} />
         )
       }
       const isExpanded = !!state.expanded[entry.path]
@@ -1347,7 +1371,7 @@ function FileTreePanel({ workspaces, sessions }) {
         {/* 内容：左预览（无激活文件时空状态） | 右文件树栏（可拖拽调宽） */}
         <div style={{ flex: '1 1 auto', display: 'flex', minHeight: 0 }}>
           {state.activePath ? <FilePreview state={state} /> : <EmptyState />}
-          {treeOn ? <TreeColumn workspaces={workspaces} state={state} dispatch={dispatch} width={treeW} onResizeStart={onTreeResizeStart} /> : null}
+          {treeOn ? <TreeColumn workspaces={workspaces} state={state} dispatch={dispatch} width={treeW} onResizeStart={onTreeResizeStart} tabKind={kind} /> : null}
         </div>
         </>
       )}
