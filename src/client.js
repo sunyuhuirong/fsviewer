@@ -396,25 +396,25 @@ class PanelErrorBoundary extends React.Component {
   }
 }
 
-// ---------- 图标（Codex 风格单色线性图标） ----------
-function IconMaximize15() {
+// ---------- 图标（Codex 风格单色线性图标，统一 16px / strokeWidth 1.3-1.5） ----------
+function IconMaximize() {
   return (
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <path d="M9.5 2.5h4v4M6.5 13.5h-4v-4M13.5 2.5 9 7M2.5 13.5 7 9" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" />
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M9.5 2.5h4v4M6.5 13.5h-4v-4M13.5 2.5 9 7M2.5 13.5 7 9" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   )
 }
-function IconCopy15() {
+function IconCopy() {
   return (
-    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" stroke="currentColor" />
       <path d="M10.5 3.5h-6a1 1 0 0 0-1 1v6" stroke="currentColor" strokeLinecap="round" />
     </svg>
   )
 }
-function IconFolder15() {
+function IconFolder() {
   return (
-    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <path d="M1.5 4.2c0-.9.7-1.6 1.6-1.6h2.8l1.6 1.8h5.4c.9 0 1.6.7 1.6 1.6v5.8c0 .9-.7 1.6-1.6 1.6H3.1c-.9 0-1.6-.7-1.6-1.6V4.2z" stroke="currentColor" strokeLinejoin="round" />
     </svg>
   )
@@ -448,8 +448,8 @@ function FilePreview({ state }) {
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '12px 16px 4px', flex: '0 0 auto' }}>
         <span style={{ fontSize: 18, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={path}>{baseName(path)}</span>
         <button type="button" onClick={copyContent} title="复制文件内容" aria-label="复制文件内容"
-          style={{ cursor: 'pointer', flex: '0 0 auto', color: V.muted, background: 'transparent', border: 'none', padding: 4, display: 'inline-flex' }}>
-          <IconCopy15 />
+          className="fsviewer-iconbtn">
+          <IconCopy />
         </button>
       </div>
       {/* 正文 */}
@@ -760,7 +760,7 @@ function FileTreePanel({ workspaces, sessions }) {
         <TabStrip state={state} dispatch={dispatch} onClose={onClose} />
         <div style={{ display: 'flex', alignItems: 'center', marginLeft: 'auto', flex: '0 0 auto' }}>
           <button type="button" onClick={toggleWide} title={wide ? '恢复默认宽度' : '加宽面板（最大 520px）'} aria-label="切换加宽"
-            className={'fsviewer-iconbtn' + (wide ? ' fsviewer-iconbtn--active' : '')}><IconMaximize15 /></button>
+            className={'fsviewer-iconbtn' + (wide ? ' fsviewer-iconbtn--active' : '')}><IconMaximize /></button>
         </div>
       </div>
       {/* 行2：面包屑 … 查看源代码 / 文件夹（收展树栏）/ 打开 */}
@@ -775,8 +775,8 @@ function FileTreePanel({ workspaces, sessions }) {
             {state.sourceMode ? '渲染视图' : '查看源代码'}</button>
           : null}
         <button type="button" onClick={() => setTreeOn(!treeOn)} title={treeOn ? '收起文件树' : '展开文件树'} aria-label="切换文件树"
-          style={{ cursor: 'pointer', flex: '0 0 auto', color: treeOn ? V.fg : V.muted, background: treeOn ? 'var(--dsw-alias-interactive-bg-active)' : 'transparent', border: '1px solid ' + V.line, borderRadius: 6, padding: 4, display: 'inline-flex' }}>
-          <IconFolder15 />
+          className={'fsviewer-iconbtn' + (treeOn ? ' fsviewer-iconbtn--active' : '')}>
+          <IconFolder />
         </button>
         {state.activePath
           ? <button type="button" onClick={openFileInSystem} title="用系统默认应用打开此文件"
