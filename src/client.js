@@ -2,16 +2,17 @@
  * fsviewer - 客户端插件（统一页签：文件 + 浏览器 + 侧边聊天，Codex 式右缘工作区）
  *
  * 全部内容收敛为 details 右栏（priority -10 影子接管）顶部的一排页签（Codex 式）：
- *   - 打开文件页签：单例（可关闭、可经 + 菜单重建），文件树 + 预览；无文件时空状态。
- *   - 文件页签：每个打开的文件一个页签。
+ *   - 打开文件页签：单例（可关闭、可经 + 菜单重建），文件树 + 预览；树中选中文件即在
+ *     当前页签内预览/切换（不再为每个文件单独开页签）；无激活文件时空状态。
  *   - 侧边聊天页签：多开，每页签独立临时会话（关闭即弃）。直连 POST /fsviewer-api/chat
  *     （宿主 ctx.llm 流式调用，SSE 下发），assistant 消息用官方 MarkdownText streaming
  *     渲染；「引用当前文件」把预览中的文件内容注入消息上下文。
  *   - 浏览器页签：多开（iframe 常驻挂载，隐藏不卸载、切回不丢状态）；
  *     URL 栏 + 后退/前进/刷新/直连|代理切换/新窗口。代理经宿主 /fsviewer-api/p/ 同源回源，
  *     绕过 X-Frame-Options；iframe 一律沙箱（直连放行 allow-same-origin，代理不放行）。
- *   - × 只显示在激活页签上；「+」弹出菜单新建 浏览器/文件/侧边聊天；⤢ 加宽面板。
- *   - 页签与会话 localStorage 持久化（防 HMR/刷新丢失）。
+ *   - 全部页签可关闭；空页签时显示三个大号创建入口（浏览器/文件/侧边聊天，Codex 空状态）。
+ *     × 只显示在激活页签上；「+」弹出菜单新建三类页签；页签条横向滚动隐藏滚动条；
+ *     页签与会话 localStorage 持久化（防 HMR/刷新丢失）。
  *
  * 入口：会话头文件按钮（order 50）与聊天按钮（order 51，跳到最近聊天页签）；
  * 快捷键 ⌥⌘S = 最近聊天页签（无则新建）、⌥⌘T = 新建浏览器页签、⌘P = 打开文件页签
@@ -42,15 +43,16 @@ let panelFileDispatch = null
 let panelDirDispatch = null
 
 // ---------- 统一页签仓库（Codex 式）：所有页签一等公民 ----------
-// kind: 'files' 打开文件（单例，可关闭、可经 + 菜单重建）
-//     | 'file'  已打开文件（每文件一个页签）
+// kind: 'files' 打开文件（单例，可关闭、可经 + 菜单重建；文件预览在页签内切换，
+//                不再为每个文件单独开页签）
 //     | 'chat'  侧边聊天（多开，每页签独立会话，关闭即弃）
 //     | 'browser' 浏览器页签（多开，iframe 常驻保活）
-// 页签 × 只显示在激活页签上（Codex 行为）；「+」弹出菜单可新建三类页签。
+// 允许全部关闭：空页签时面板显示三类创建入口（Codex 空状态，见图）。
+// 页签 × 只显示在激活页签上；「+」弹出菜单可新建三类页签。
 const TABS_KEY = 'fsviewer/tabs.v2'
 let tabs = []
 let activeTabId = null
-let seq = { f: 0, c: 0, b: 0 }
+let seq = { c: 0, b: 0 }
 const browserById = {}   // 浏览器页签运行态：{ title, url, input, proxy, hist, idx, reload }
 const chatById = {}      // 聊天页签会话：{ messages, route }（streaming/abort 为运行态，不持久化）
 let tabsHydrated = false
@@ -79,7 +81,8 @@ function hydrateTabs() {
   try {
     const d = JSON.parse(localStorage.getItem(TABS_KEY) || 'null')
     if (d && Array.isArray(d.tabs) && d.tabs.length) {
-      tabs = d.tabs.filter((t) => t && t.id && t.kind)
+      // v2 早期曾有过 'file' 类页签，读取时丢弃（预览改在打开文件页签内切换）
+      tabs = d.tabs.filter((t) => t && t.id && t.kind && t.kind !== 'file')
       for (const [id, b] of Object.entries(d.browser || {})) {
         browserById[id] = { title: '新标签页', url: null, input: '', proxy: false, hist: [], idx: -1, reload: 0, ...b }
       }
@@ -92,11 +95,10 @@ function hydrateTabs() {
         }
       }
       for (const t of tabs) {
-        if (t.kind === 'file') seq.f = Math.max(seq.f, Number(String(t.id).slice(1)) || 0)
-        else if (t.kind === 'chat') seq.c = Math.max(seq.c, Number(String(t.id).slice(1)) || 0)
+        if (t.kind === 'chat') seq.c = Math.max(seq.c, Number(String(t.id).slice(1)) || 0)
         else if (t.kind === 'browser') seq.b = Math.max(seq.b, Number(String(t.id).slice(1)) || 0)
       }
-      activeTabId = tabs.some((t) => t.id === d.activeTabId) ? d.activeTabId : tabs[tabs.length - 1].id
+      activeTabId = tabs.some((t) => t.id === d.activeTabId) ? d.activeTabId : (tabs[tabs.length - 1] ? tabs[tabs.length - 1].id : null)
       return
     }
   } catch { /* 历史损坏按默认 */ }
@@ -121,20 +123,13 @@ function closeTab(id) {
   if (closed.kind === 'chat') delete chatById[id]   // 临时会话：关闭即弃
   if (activeTabId === id) {
     const next = tabs[Math.min(idx, tabs.length - 1)]
-    activeTabId = next ? next.id : null
+    activeTabId = next ? next.id : null             // 全部关闭 → 空页签状态
   }
-  if (!tabs.length) { tabs = [{ id: 'files', kind: 'files' }]; activeTabId = 'files' }
   persistTabs(); notifyTabs()
 }
 function ensureFilesTab() {
   let t = tabs.find((t) => t.kind === 'files')
   if (!t) { t = { id: 'files', kind: 'files' }; tabs = tabs.concat(t) }
-  activeTabId = t.id
-  persistTabs(); notifyTabs()
-}
-function openFileTab(path) {
-  let t = tabs.find((t) => t.kind === 'file' && t.path === path)
-  if (!t) { t = { id: mkId('f'), kind: 'file', path }; tabs = tabs.concat(t) }
   activeTabId = t.id
   persistTabs(); notifyTabs()
 }
@@ -387,7 +382,9 @@ function openPanelWithRoom() {
 }
 function openFileInPanel(path) {
   openPanelWithRoom()
-  openFileTab(path)
+  ensureFilesTab()
+  if (panelFileDispatch) panelFileDispatch(path)
+  else if (nativeOpenPath) nativeOpenPath(path)
 }
 // 目录引用点击（如「在文件夹中显示」）：面板树直接定位到该目录
 function openDirInPanel(path) {
@@ -483,6 +480,15 @@ function injectToggleStyle() {
     '.fsviewer-plus-item:hover{background:var(--dsw-alias-interactive-bg-hover)}' +
     '.fsviewer-plus-item svg{flex:0 0 auto;color:var(--dsw-alias-label-secondary)}' +
     '.fsviewer-plus-hint{color:var(--dsw-alias-label-secondary);font-size:11px}' +
+    // 页签条横向滚动不显示滚动条（避免占位）
+    '.fsviewer-tabstrip{scrollbar-width:none;-ms-overflow-style:none}' +
+    '.fsviewer-tabstrip::-webkit-scrollbar{display:none}' +
+    // 空页签状态的大号创建入口
+    '.fsviewer-empty-item{display:flex;align-items:center;gap:12px;width:100%;padding:14px 18px;' +
+    'border:none;border-radius:12px;background:var(--dsw-alias-interactive-bg-hover);' +
+    'color:var(--dsw-alias-label-primary);font-size:14px;cursor:pointer;font-family:inherit}' +
+    '.fsviewer-empty-item:hover{background:var(--dsw-alias-interactive-bg-active)}' +
+    '.fsviewer-empty-item svg{flex:0 0 auto;color:var(--dsw-alias-label-secondary)}' +
     // 侧边聊天（面板内页签视图，充满 details 列）
     '.fsviewer-chat-scroll{flex:1 1 auto;overflow-y:auto;overflow-x:hidden;padding:12px 14px;' +
     'display:flex;flex-direction:column;gap:10px;min-height:0}' +
@@ -951,7 +957,7 @@ function TreeColumn({ workspaces, state, dispatch, width, onResizeStart }) {
         return (
           <FileRow key={entry.path} entry={entry} depth={depth}
             active={entry.path === state.activePath}
-            onOpen={() => openFileInPanel(entry.path)} />
+            onOpen={() => dispatch({ type: 'setActive', path: entry.path })} />
         )
       }
       const isExpanded = !!state.expanded[entry.path]
@@ -1031,7 +1037,6 @@ function TabStrip() {
   const tabLabel = (t) => {
     if (t.kind === 'files') return '打开文件'
     if (t.kind === 'chat') return '侧边聊天'
-    if (t.kind === 'file') return baseName(t.path)
     return (browserById[t.id] && browserById[t.id].title) || '新标签页'
   }
   const tabIcon = (t) => {
@@ -1041,7 +1046,7 @@ function TabStrip() {
     return null
   }
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 4, flex: '1 1 auto', minWidth: 0, overflowX: 'auto', padding: '6px 0 6px 8px' }}>
+    <div className="fsviewer-tabstrip" style={{ display: 'flex', alignItems: 'center', gap: 4, flex: '1 1 auto', minWidth: 0, overflowX: 'auto', padding: '6px 0 6px 8px' }}>
       {tabs.map((t) => {
         const active = t.id === activeTabId
         return (
@@ -1049,9 +1054,9 @@ function TabStrip() {
             {t.kind === 'browser' && firstBrowser && firstBrowser.id === t.id && tabs[0].kind !== 'browser'
               ? <span className="fsviewer-tab-divider" />
               : null}
-            <span className={'fsviewer-tab' + (active ? ' fsviewer-tab--active' : '')}
-              onClick={() => activateTab(t.id)}
-              title={t.kind === 'file' ? t.path : tabLabel(t)}>
+              <span className={'fsviewer-tab' + (active ? ' fsviewer-tab--active' : '')}
+                onClick={() => activateTab(t.id)}
+                title={tabLabel(t)}>
               {tabIcon(t)}
               <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{tabLabel(t)}</span>
               {active
@@ -1062,8 +1067,12 @@ function TabStrip() {
           </React.Fragment>
         )
       })}
-      <span ref={plusRef} className="fsviewer-tab" title="新建页签"
-        onClick={() => (menu ? setMenu(null) : openMenu())}>+</span>
+      {tabs.length > 0
+        ? (
+          <span ref={plusRef} className="fsviewer-tab" title="新建页签"
+            onClick={() => (menu ? setMenu(null) : openMenu())}>+</span>
+        )
+        : null}
       {menu
         ? (
           <>
@@ -1092,18 +1101,10 @@ function FileTreePanel({ workspaces, sessions }) {
 
   // 注册程序化打开入口：会话内点击文件引用经此在面板中预览
   React.useEffect(() => {
-    panelFileDispatch = (p) => openFileTab(p)
+    panelFileDispatch = (p) => dispatch({ type: 'setActive', path: p })
     panelDirDispatch = (p) => dispatch({ type: 'gotoRoot', root: p })
     return () => { panelFileDispatch = null; panelDirDispatch = null }
   }, [dispatch])
-  // 统一页签仓库 -> 激活文件派生：激活文件页签时预览该文件，激活其余页签时清空预览
-  const activeTab = useActiveTab()
-  React.useEffect(() => {
-    const p = activeTab && activeTab.kind === 'file' ? activeTab.path : null
-    if (p !== state.activePath) dispatch({ type: 'setActive', path: p })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, state.activePath])
-
   // 右栏可见性：原生列收起时宽度为 0（仍挂载）——宽度 > 80px 视为展开，才加载数据
   const [visible, setVisible] = React.useState(false)
   // 树栏宽度（模块级记忆）；树栏开关
@@ -1267,7 +1268,8 @@ function FileTreePanel({ workspaces, sessions }) {
   }
 
   const activeFile = state.activePath ? state.files[state.activePath] : null
-  const kind = activeTab ? activeTab.kind : 'files'
+  const activeTab = useActiveTab()
+  const kind = activeTab ? activeTab.kind : 'empty'
   const showSourceBtn = !!(state.activePath && isMdFile(baseName(state.activePath)) && activeFile && activeFile.status === 'ok' && !activeFile.binary)
   // ⧉ 打开 = 在系统文件管理器中打开文件所在文件夹（macOS：Finder）
   const dirOf = (p) => { const i = p.lastIndexOf('/'); return i <= 0 ? '/' : p.slice(0, i) }
@@ -1288,7 +1290,7 @@ function FileTreePanel({ workspaces, sessions }) {
       fontFamily: V.font,
       fontSize: '13px'
     }}>
-      {/* 行1：统一页签条（打开文件 | 文件页签 | 侧边聊天 | 浏览器页签 | +菜单）… ⤢ 加宽/还原 */}
+      {/* 行1：统一页签条（打开文件 | 侧边聊天 | 浏览器页签 | +菜单）… ⤢ 加宽/还原 */}
       <div style={{ display: 'flex', alignItems: 'center', minHeight: 56, borderBottom: '1px solid ' + V.line, flex: '0 0 auto', paddingRight: 6 }}>
         <TabStrip />
         <div style={{ display: 'flex', alignItems: 'center', marginLeft: 'auto', flex: '0 0 auto' }}>
@@ -1300,6 +1302,8 @@ function FileTreePanel({ workspaces, sessions }) {
         <ChatPanel chatId={activeTab.id} />
       ) : kind === 'browser' ? (
         <BrowserPane tabId={activeTab.id} />
+      ) : kind === 'empty' ? (
+        <EmptyTabsState />
       ) : (
         <>
         {/* 行2：面包屑 … 查看源代码 / 文件夹（收展树栏）/ 打开。右边距与行1一致，文件夹与 ⤢ 右缘对齐 */}
@@ -1412,6 +1416,26 @@ function BrowserPane({ tabId }) {
           )
         })}
       </div>
+    </div>
+  )
+}
+
+// ---------- 空页签状态（全部关闭时）：大号创建入口，同 Codex 空状态 ----------
+function EmptyTabsState() {
+  const rows = [
+    { key: 'b', icon: <IconGlobe />, label: '浏览器', hint: '⌥⌘T', act: newBrowserTab },
+    { key: 'f', icon: <IconFileLine />, label: '文件', hint: '⌘P', act: ensureFilesTab },
+    { key: 'c', icon: <IconChatBubble />, label: '侧边聊天', hint: '⌥⌘S', act: newChatTab }
+  ]
+  return (
+    <div style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 12, padding: '0 26px', minHeight: 0 }}>
+      {rows.map((r) => (
+        <button key={r.key} type="button" className="fsviewer-empty-item" onClick={r.act}>
+          {r.icon}
+          <span style={{ flex: '1 1 auto', textAlign: 'left' }}>{r.label}</span>
+          <span className="fsviewer-plus-hint">{r.hint}</span>
+        </button>
+      ))}
     </div>
   )
 }
