@@ -926,7 +926,7 @@ function FileTreePanel({ workspaces, sessions }) {
         </span>
         {showSourceBtn
           ? <button type="button" onClick={() => dispatch({ type: 'toggleSource' })} title="切换渲染/源码视图"
-            style={{ cursor: 'pointer', flex: '0 0 auto', fontSize: 12, padding: '3px 10px', borderRadius: 6, border: '1px solid ' + V.line, background: state.sourceMode ? V.input : 'transparent', color: V.fg }}>
+            style={{ cursor: 'pointer', flex: '0 0 auto', height: 28, fontSize: 12, lineHeight: 1, padding: '0 10px', borderRadius: 6, border: '1px solid ' + V.line, background: state.sourceMode ? V.input : 'transparent', color: V.fg, display: 'inline-flex', alignItems: 'center' }}>
             {state.sourceMode ? '渲染视图' : '查看源代码'}</button>
           : null}
         <button type="button" onClick={() => setTreeOn(!treeOn)} data-tip={treeOn ? '收起文件树' : '展开文件树'} aria-label="切换文件树"
@@ -936,7 +936,7 @@ function FileTreePanel({ workspaces, sessions }) {
         {state.activePath
           ? <button type="button" onClick={openFolderInSystem} data-tip={openFolderTip} aria-label={openFolderTip}
             className="fsviewer-tip"
-            style={{ cursor: 'pointer', flex: '0 0 auto', fontSize: 12, padding: '2px 8px', borderRadius: 6, border: '1px solid ' + V.line, background: 'transparent', color: V.fg, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+            style={{ cursor: 'pointer', flex: '0 0 auto', height: 28, fontSize: 12, lineHeight: 1, padding: '0 8px', borderRadius: 6, border: '1px solid ' + V.line, background: 'transparent', color: V.fg, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
             <IconFinder />打开</button>
           : null}
       </div>
