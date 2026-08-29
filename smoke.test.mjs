@@ -60,7 +60,7 @@ const stubCtx = {
 }
 exports.apply(stubCtx)
 
-if (registrations.length !== 4) throw new Error('expected exactly 4 slot registrations, got ' + registrations.length)
+if (registrations.length !== 3) throw new Error('expected exactly 3 slot registrations, got ' + registrations.length)
 const utilReg = registrations.find((r) => r.meta.name === 'conversation.session.header.utilities' && r.meta.id === 'fsviewer-toggle')
 const chatToggleReg = registrations.find((r) => r.meta.name === 'conversation.session.header.utilities' && r.meta.id === 'fsviewer-chat-toggle')
 const detailsReg = registrations.find((r) => r.meta.name === 'details')
@@ -71,8 +71,6 @@ if (detailsReg) {
   if (detailsReg.meta.id !== 'fsviewer-panel') throw new Error('wrong details id: ' + detailsReg.meta.id)
   if (detailsReg.meta.priority !== -10) throw new Error('details priority should be -10 (shadow conversation), got ' + detailsReg.meta.priority)
 } else throw new Error('missing details registration')
-const overlayReg = registrations.find((r) => r.meta.name === 'shell.overlay' && r.meta.id === 'fsviewer-chat')
-if (!overlayReg) throw new Error('missing shell.overlay chat registration')
 const reg = detailsReg
 if (!reg.comp || !reg.comp.element) throw new Error('component factory returned unexpected value')
 
