@@ -36,6 +36,8 @@ let layoutApi = null
 let nativeOpenPath = null
 // FileTreePanel 挂载时注册的程序化打开文件入口
 let panelFileDispatch = null
+// FileTreePanel 挂载时注册的程序化「树根跳转」入口（目录引用点击 → 面板树定位）
+let panelDirDispatch = null
 
 // ---------- 小窗口展开前的让位 ----------
 // 原生让位链：details 先被挤压、再自动关闭（保 center ≥ 640），左栏从不让位。
@@ -133,6 +135,12 @@ function openPanelWithRoom() {
 function openFileInPanel(path) {
   openPanelWithRoom()
   if (panelFileDispatch) panelFileDispatch(path)
+  else if (nativeOpenPath) nativeOpenPath(path)
+}
+// 目录引用点击（如「在文件夹中显示」）：面板树直接定位到该目录
+function openDirInPanel(path) {
+  openPanelWithRoom()
+  if (panelDirDispatch) panelDirDispatch(path)
   else if (nativeOpenPath) nativeOpenPath(path)
 }
 function subscribePanel(fn) { panelListeners.add(fn); return () => panelListeners.delete(fn) }
@@ -390,6 +398,9 @@ function reducer(state, action) {
   switch (action.type) {
     case 'setRoot':
       return { ...state, root: action.root }
+    case 'gotoRoot':
+      // 程序化树根跳转（目录引用点击）：nonce +1 保证同根也强制重载
+      return { ...state, root: action.root, nonce: state.nonce + 1 }
     case 'refresh':
       return { ...state, nonce: state.nonce + 1 }
     case 'loadStart':
@@ -712,7 +723,8 @@ function FileTreePanel({ workspaces, sessions }) {
   // 注册程序化打开入口：会话内点击文件引用经此在面板中预览
   React.useEffect(() => {
     panelFileDispatch = (p) => dispatch({ type: 'openFile', path: p })
-    return () => { panelFileDispatch = null }
+    panelDirDispatch = (p) => dispatch({ type: 'gotoRoot', root: p })
+    return () => { panelFileDispatch = null; panelDirDispatch = null }
   }, [dispatch])
   // 右栏可见性：原生列收起时宽度为 0（仍挂载）——宽度 > 80px 视为展开，才加载数据
   const [visible, setVisible] = React.useState(false)
@@ -928,12 +940,20 @@ export function apply(ctx) {
   // 捕获布局服务：顶部按钮开/收原生右栏
   layoutApi = ctx.layout || null
   // 拦截系统打开：会话内点击文件引用改道到插件预览（保留原生打开供面板 ⧉ 使用）。
-  // 目录（尾斜杠）与插件未就绪时保持原生行为。
+  // 引用路径不带类型标记，先探测：list 接口对目录返回 200、对文件返回 400「不是目录」——
+  // 目录 → 面板树定位到该目录（如「在文件夹中显示」）；文件 → 预览；
+  // 探测失败（404/500/主机未就绪）→ 保持原生行为。尾斜杠路径保持原生。
   if (ctx.workspaces && typeof ctx.workspaces.openPath === 'function') {
     nativeOpenPath = ctx.workspaces.openPath.bind(ctx.workspaces)
     ctx.workspaces.openPath = (path) => {
       if (typeof path === 'string' && path.length > 0 && !path.endsWith('/')) {
-        openFileInPanel(path)
+        fetchList(path).then(
+          () => openDirInPanel(path),
+          (e) => {
+            if (e && e.message && e.message.includes('不是目录')) openFileInPanel(path)
+            else if (nativeOpenPath) return nativeOpenPath(path)
+          }
+        )
         return Promise.resolve()
       }
       return nativeOpenPath(path)
