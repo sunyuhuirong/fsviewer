@@ -1,19 +1,21 @@
 /**
  * fsviewer - 客户端插件（统一页签：文件 + 浏览器 + 侧边聊天，Codex 式右缘工作区）
  *
- * 全部内容收敛为 details 右栏（priority -10 影子接管）顶部的一排页签（图2 式）：
- *   - 文件页签：已打开文件，左预览右树，页签/筛选/拖宽/⤢ 加宽；无文件时「打开文件」伪页签。
- *   - 侧边聊天页签：常驻（图标 + 无 ×）。直连 POST /fsviewer-api/chat（宿主 ctx.llm
- *     流式调用，SSE 下发），assistant 消息用官方 MarkdownText streaming 渲染；
- *     「引用当前文件」把预览中的文件内容注入消息上下文；历史 localStorage 持久化。
- *   - 浏览器页签：多开（globe 图标 + ×），iframe 常驻挂载（隐藏不卸载、切回不丢状态）；
+ * 全部内容收敛为 details 右栏（priority -10 影子接管）顶部的一排页签（Codex 式）：
+ *   - 打开文件页签：单例（可关闭、可经 + 菜单重建），文件树 + 预览；无文件时空状态。
+ *   - 文件页签：每个打开的文件一个页签。
+ *   - 侧边聊天页签：多开，每页签独立临时会话（关闭即弃）。直连 POST /fsviewer-api/chat
+ *     （宿主 ctx.llm 流式调用，SSE 下发），assistant 消息用官方 MarkdownText streaming
+ *     渲染；「引用当前文件」把预览中的文件内容注入消息上下文。
+ *   - 浏览器页签：多开（iframe 常驻挂载，隐藏不卸载、切回不丢状态）；
  *     URL 栏 + 后退/前进/刷新/直连|代理切换/新窗口。代理经宿主 /fsviewer-api/p/ 同源回源，
- *     绕过 X-Frame-Options；iframe 一律沙箱（无 allow-same-origin / top 导航）。
- *   - 「+」新建浏览器页签；⤢ 加宽面板。
+ *     绕过 X-Frame-Options；iframe 一律沙箱（直连放行 allow-same-origin，代理不放行）。
+ *   - × 只显示在激活页签上；「+」弹出菜单新建 浏览器/文件/侧边聊天；⤢ 加宽面板。
+ *   - 页签与会话 localStorage 持久化（防 HMR/刷新丢失）。
  *
- * 入口：会话头文件按钮（order 50）与聊天按钮（order 51）；快捷键 ⌥⌘S = 打开面板并
- * 激活聊天页签（同 Codex）、⌥⌘T = 新建浏览器页签（⌘T 留给浏览器本体）。dsh 无原生
- * 快捷键注册 API，用 e.code DOM 监听。
+ * 入口：会话头文件按钮（order 50）与聊天按钮（order 51，跳到最近聊天页签）；
+ * 快捷键 ⌥⌘S = 最近聊天页签（无则新建）、⌥⌘T = 新建浏览器页签、⌘P = 打开文件页签
+ * （⌘T 留给浏览器本体）。dsh 无原生快捷键注册 API，用 e.code DOM 监听。
  *
  * 数据来源：
  *   - 目录/文件：GET /fsviewer-api/list、/file；聊天：POST /fsviewer-api/chat（SSE）
@@ -39,82 +41,132 @@ let panelFileDispatch = null
 // FileTreePanel 挂载时注册的程序化「树根跳转」入口（目录引用点击 → 面板树定位）
 let panelDirDispatch = null
 
-// ---------- 统一页签模型：文件页签 | 侧边聊天（常驻） | 浏览器页签（多开） ----------
-// 图2 Codex 式：面板内所有内容都收敛为页签，paneMode 决定当前呈现哪类内容
-// （'file' | 'chat' | 'browser'），localStorage 持久化防 HMR 丢失。
-let paneMode = 'file'
-try {
-  const saved = localStorage.getItem('fsviewer/pane.v1')
-  if (saved === 'file' || saved === 'chat' || saved === 'browser') paneMode = saved
-} catch { /* 无 localStorage（非浏览器环境）按默认 */ }
-const paneListeners = new Set()
-function subscribePane(fn) { paneListeners.add(fn); return () => paneListeners.delete(fn) }
-function setPaneMode(v) {
-  if (v === paneMode) return
-  paneMode = v
-  try { localStorage.setItem('fsviewer/pane.v1', v) } catch { /* 忽略 */ }
-  paneListeners.forEach((l) => l())
-}
-function usePaneMode() {
-  const [, force] = React.useState()
-  React.useEffect(() => subscribePane(() => force({})), [])
-  return paneMode
-}
-
-// 浏览器页签仓库（模块级，多开；隐藏 iframe 常驻挂载保活页面状态）
-const BROWSER_KEY = 'fsviewer/browser-tabs.v1'
-let browserSeq = 0
-let browserTabs = []   // { id, title, url, input, proxy, hist, idx, reload }
-let activeBrowserTabId = null
-let browserHydrated = false
-const browserListeners = new Set()
-function subscribeBrowser(fn) { browserListeners.add(fn); return () => browserListeners.delete(fn) }
-function notifyBrowser() { browserListeners.forEach((l) => l()) }
-function persistBrowser() {
-  try { localStorage.setItem(BROWSER_KEY, JSON.stringify({ tabs: browserTabs, active: activeBrowserTabId })) } catch { /* 忽略 */ }
-}
-function hydrateBrowser() {
-  if (browserHydrated) return
-  browserHydrated = true
+// ---------- 统一页签仓库（Codex 式）：所有页签一等公民 ----------
+// kind: 'files' 打开文件（单例，可关闭、可经 + 菜单重建）
+//     | 'file'  已打开文件（每文件一个页签）
+//     | 'chat'  侧边聊天（多开，每页签独立会话，关闭即弃）
+//     | 'browser' 浏览器页签（多开，iframe 常驻保活）
+// 页签 × 只显示在激活页签上（Codex 行为）；「+」弹出菜单可新建三类页签。
+const TABS_KEY = 'fsviewer/tabs.v2'
+let tabs = []
+let activeTabId = null
+let seq = { f: 0, c: 0, b: 0 }
+const browserById = {}   // 浏览器页签运行态：{ title, url, input, proxy, hist, idx, reload }
+const chatById = {}      // 聊天页签会话：{ messages, route }（streaming/abort 为运行态，不持久化）
+let tabsHydrated = false
+const tabsListeners = new Set()
+function subscribeTabs(fn) { tabsListeners.add(fn); return () => tabsListeners.delete(fn) }
+function notifyTabs() { tabsListeners.forEach((l) => l()) }
+function persistTabs() {
   try {
-    const d = JSON.parse(localStorage.getItem(BROWSER_KEY) || 'null')
-    if (d && Array.isArray(d.tabs)) {
-      browserTabs = d.tabs
-        .filter((t) => t && t.id)
-        .map((t) => ({ title: '新标签页', url: null, input: '', proxy: false, hist: [], idx: -1, reload: 0, ...t }))
-      browserSeq = browserTabs.reduce((m, t) => Math.max(m, Number(String(t.id).slice(1)) || 0), 0)
+    const chats = {}
+    for (const [id, c] of Object.entries(chatById)) {
+      chats[id] = {
+        route: c.route || null,
+        messages: c.messages
+          .filter((m) => !m.error && typeof m.content === 'string' && m.content.length)
+          .slice(-40)
+          .map((m) => ({ role: m.role, content: m.content }))
+      }
     }
-    if (d && d.active && browserTabs.some((t) => t.id === d.active)) activeBrowserTabId = d.active
-    else activeBrowserTabId = browserTabs.length ? browserTabs[browserTabs.length - 1].id : null
-  } catch { /* 历史损坏按空处理 */ }
+    localStorage.setItem(TABS_KEY, JSON.stringify({ tabs, activeTabId, browser: browserById, chats }))
+  } catch { /* 配额满等忽略 */ }
+}
+function mkId(kind) { return kind + (++seq[kind]) }
+function hydrateTabs() {
+  if (tabsHydrated) return
+  tabsHydrated = true
+  try {
+    const d = JSON.parse(localStorage.getItem(TABS_KEY) || 'null')
+    if (d && Array.isArray(d.tabs) && d.tabs.length) {
+      tabs = d.tabs.filter((t) => t && t.id && t.kind)
+      for (const [id, b] of Object.entries(d.browser || {})) {
+        browserById[id] = { title: '新标签页', url: null, input: '', proxy: false, hist: [], idx: -1, reload: 0, ...b }
+      }
+      for (const [id, c] of Object.entries(d.chats || {})) {
+        chatById[id] = {
+          route: (c && c.route) || null,
+          messages: (c && Array.isArray(c.messages) ? c.messages : [])
+            .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.length)
+            .slice(-60)
+        }
+      }
+      for (const t of tabs) {
+        if (t.kind === 'file') seq.f = Math.max(seq.f, Number(String(t.id).slice(1)) || 0)
+        else if (t.kind === 'chat') seq.c = Math.max(seq.c, Number(String(t.id).slice(1)) || 0)
+        else if (t.kind === 'browser') seq.b = Math.max(seq.b, Number(String(t.id).slice(1)) || 0)
+      }
+      activeTabId = tabs.some((t) => t.id === d.activeTabId) ? d.activeTabId : tabs[tabs.length - 1].id
+      return
+    }
+  } catch { /* 历史损坏按默认 */ }
+  // 默认页签条（Codex 默认）：打开文件 + 一个侧边聊天
+  const c = mkId('c')
+  tabs = [{ id: 'files', kind: 'files' }, { id: c, kind: 'chat' }]
+  chatById[c] = { messages: [], route: null }
+  activeTabId = 'files'
+}
+function getActiveTab() { return tabs.find((t) => t.id === activeTabId) || null }
+function activateTab(id) {
+  if (!tabs.some((t) => t.id === id)) return
+  activeTabId = id
+  persistTabs(); notifyTabs()
+}
+function closeTab(id) {
+  const idx = tabs.findIndex((t) => t.id === id)
+  if (idx < 0) return
+  const closed = tabs[idx]
+  tabs = tabs.filter((t) => t.id !== id)
+  if (closed.kind === 'browser') delete browserById[id]
+  if (closed.kind === 'chat') delete chatById[id]   // 临时会话：关闭即弃
+  if (activeTabId === id) {
+    const next = tabs[Math.min(idx, tabs.length - 1)]
+    activeTabId = next ? next.id : null
+  }
+  if (!tabs.length) { tabs = [{ id: 'files', kind: 'files' }]; activeTabId = 'files' }
+  persistTabs(); notifyTabs()
+}
+function ensureFilesTab() {
+  let t = tabs.find((t) => t.kind === 'files')
+  if (!t) { t = { id: 'files', kind: 'files' }; tabs = tabs.concat(t) }
+  activeTabId = t.id
+  persistTabs(); notifyTabs()
+}
+function openFileTab(path) {
+  let t = tabs.find((t) => t.kind === 'file' && t.path === path)
+  if (!t) { t = { id: mkId('f'), kind: 'file', path }; tabs = tabs.concat(t) }
+  activeTabId = t.id
+  persistTabs(); notifyTabs()
 }
 function newBrowserTab() {
-  const t = { id: 'b' + (++browserSeq), title: '新标签页', url: null, input: '', proxy: false, hist: [], idx: -1, reload: 0 }
-  browserTabs = browserTabs.concat(t)
-  activeBrowserTabId = t.id
-  setPaneMode('browser')
-  persistBrowser(); notifyBrowser()
+  const id = mkId('b')
+  browserById[id] = { title: '新标签页', url: null, input: '', proxy: false, hist: [], idx: -1, reload: 0 }
+  tabs = tabs.concat({ id, kind: 'browser' })
+  activeTabId = id
+  persistTabs(); notifyTabs()
 }
-function closeBrowserTab(id) {
-  const idx = browserTabs.findIndex((t) => t.id === id)
-  if (idx < 0) return
-  browserTabs = browserTabs.filter((t) => t.id !== id)
-  if (activeBrowserTabId === id) {
-    const next = browserTabs[Math.min(idx, browserTabs.length - 1)]
-    activeBrowserTabId = next ? next.id : null
-    if (!next) setPaneMode('file')
-  }
-  persistBrowser(); notifyBrowser()
+function newChatTab() {
+  const id = mkId('c')
+  chatById[id] = { messages: [], route: null }
+  tabs = tabs.concat({ id, kind: 'chat' })
+  activeTabId = id
+  persistTabs(); notifyTabs()
 }
-function activateBrowserTab(id) {
-  if (!browserTabs.some((t) => t.id === id)) return
-  activeBrowserTabId = id
-  setPaneMode('browser')
-  persistBrowser(); notifyBrowser()
+function activateLatestChat() {
+  const t = [...tabs].reverse().find((t) => t.kind === 'chat')
+  if (t) activateTab(t.id)
+  else newChatTab()
 }
-function updateBrowserTab(id, fn) {
-  browserTabs = browserTabs.map((t) => (t.id === id ? fn(t) : t))
-  persistBrowser(); notifyBrowser()
+function updateBrowser(id, fn) {
+  if (!browserById[id]) return
+  browserById[id] = fn(browserById[id])
+  persistTabs(); notifyTabs()
+}
+function useActiveTab() {
+  hydrateTabs()
+  const [, force] = React.useState()
+  React.useEffect(() => subscribeTabs(() => force({})), [])
+  return getActiveTab()
 }
 
 // ---------- 当前预览文件上下文（聊天「引用当前文件」的数据源） ----------
@@ -137,69 +189,46 @@ function useCurrentFileCtx() {
   return currentFileCtx
 }
 
-// ---------- 聊天数据（模块级单例：开合/挂载周期与消息流解耦，localStorage 持久化） ----------
-const CHAT_STORE_KEY = 'fsviewer/chat.v1'
+// ---------- 聊天会话（每页签独立，多开；会话存于 chatById，随统一页签持久化） ----------
 const CHAT_QUOTE_CHARS = 32000     // 引用文件注入正文的上限
-const chatStore = {
-  messages: [],   // {role:'user'|'assistant', content, reasoning?, streaming?, error?, note?}
-  route: null,    // SSE meta 帧回显的 {provider, model}
-  streaming: false
+const chatAbort = {}               // chatId -> AbortController（运行态）
+function getChat(id) { return chatById[id] || (chatById[id] = { messages: [], route: null }) }
+function updateChat(id, fn) {
+  chatById[id] = fn(chatById[id]) || chatById[id]
+  persistTabs(); notifyTabs()
 }
-let chatHydrated = false
-let chatAbort = null
-const chatListeners = new Set()
-function hydrateChat() {
-  if (chatHydrated) return
-  chatHydrated = true
-  try {
-    const data = JSON.parse(localStorage.getItem(CHAT_STORE_KEY) || 'null')
-    if (data && Array.isArray(data.messages)) {
-      chatStore.messages = data.messages
-        .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.length)
-        .slice(-60)
-    }
-    if (data && data.route && typeof data.route.provider === 'string') chatStore.route = data.route
-  } catch { /* 历史损坏按空处理 */ }
-}
-function persistChat() {
-  try {
-    localStorage.setItem(CHAT_STORE_KEY, JSON.stringify({
-      messages: chatStore.messages.slice(-60).filter((m) => !m.error).map((m) => ({ role: m.role, content: m.content })),
-      route: chatStore.route
-    }))
-  } catch { /* 配额满等忽略 */ }
-}
-function notifyChat() { chatListeners.forEach((l) => l()) }
-function subscribeChat(fn) { chatListeners.add(fn); return () => chatListeners.delete(fn) }
-function lastAssistant() {
-  const m = chatStore.messages[chatStore.messages.length - 1]
+function lastAssistant(c) {
+  const m = c.messages[c.messages.length - 1]
   return m && m.role === 'assistant' ? m : null
 }
 
 /** 发送一轮：追加 user + 空 assistant，读 SSE 帧增量填充；abort/错误都落在 assistant 消息上 */
-async function sendChat(text, fileCtx) {
+async function sendChat(chatId, text, fileCtx) {
   const trimmed = text.trim()
-  if (!trimmed || chatStore.streaming) return
+  const c = getChat(chatId)
+  if (!trimmed || c.streaming) return
   let content = trimmed
   if (fileCtx && typeof fileCtx.content === 'string') {
     const clip = fileCtx.content.slice(0, CHAT_QUOTE_CHARS)
     const more = fileCtx.content.length > CHAT_QUOTE_CHARS ? '\n…（已截断）' : ''
     content += '\n\n---\n[引用文件: ' + fileCtx.path + (fileCtx.truncated ? '，前 1MB' : '') + ']\n```\n' + clip + more + '\n```'
   }
-  chatStore.messages = chatStore.messages.concat([
-    { role: 'user', content },
-    { role: 'assistant', content: '', streaming: true }
-  ])
-  chatStore.streaming = true
-  notifyChat(); persistChat()
+  updateChat(chatId, (cur) => {
+    cur.messages = cur.messages.concat([
+      { role: 'user', content },
+      { role: 'assistant', content: '', streaming: true }
+    ])
+    cur.streaming = true
+    return cur
+  })
   const ctrl = new AbortController()
-  chatAbort = ctrl
+  chatAbort[chatId] = ctrl
   try {
     const res = await fetch('/fsviewer-api/chat', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        messages: chatStore.messages.slice(0, -1).map((m) => ({ role: m.role, content: m.content }))
+        messages: getChat(chatId).messages.slice(0, -1).map((m) => ({ role: m.role, content: m.content }))
       }),
       signal: ctrl.signal
     })
@@ -223,33 +252,44 @@ async function sendChat(text, fileCtx) {
         if (!dataLine) continue
         let evt
         try { evt = JSON.parse(dataLine.slice(5).trim()) } catch { continue }
-        const m = lastAssistant()
-        if (evt.meta && evt.meta.provider) chatStore.route = evt.meta
-        else if (evt.delta && m) {
-          if (typeof evt.delta.text === 'string') m.content += evt.delta.text
-          else if (typeof evt.delta.reasoning === 'string') m.reasoning = (m.reasoning || '') + evt.delta.reasoning
-        } else if (evt.error && m) m.error = evt.error
-        else if (evt.done && evt.done.finish === 'max-tokens' && m) m.note = '回复达到 token 上限，可能被截断'
-        notifyChat()
+        updateChat(chatId, (cur) => {
+          const m = lastAssistant(cur)
+          if (evt.meta && evt.meta.provider) cur.route = evt.meta
+          else if (evt.delta && m) {
+            if (typeof evt.delta.text === 'string') m.content += evt.delta.text
+            else if (typeof evt.delta.reasoning === 'string') m.reasoning = (m.reasoning || '') + evt.delta.reasoning
+          } else if (evt.error && m) m.error = evt.error
+          else if (evt.done && evt.done.finish === 'max-tokens' && m) m.note = '回复达到 token 上限，可能被截断'
+          return cur
+        })
       }
     }
   } catch (e) {
-    const m = lastAssistant()
-    if (!ctrl.signal.aborted && m) m.error = humanError(e)
+    if (!ctrl.signal.aborted) {
+      updateChat(chatId, (cur) => {
+        const m = lastAssistant(cur)
+        if (m) m.error = humanError(e)
+        return cur
+      })
+    }
   } finally {
-    const m = lastAssistant()
-    if (m) delete m.streaming
-    chatStore.streaming = false
-    chatAbort = null
-    notifyChat(); persistChat()
+    updateChat(chatId, (cur) => {
+      const m = lastAssistant(cur)
+      if (m) delete m.streaming
+      cur.streaming = false
+      return cur
+    })
+    delete chatAbort[chatId]
   }
 }
-function stopChat() { if (chatAbort) chatAbort.abort() }
-function clearChat() {
-  if (chatStore.streaming) stopChat()
-  chatStore.messages = []
-  chatStore.route = null
-  notifyChat(); persistChat()
+function stopChat(chatId) { if (chatAbort[chatId]) chatAbort[chatId].abort() }
+function clearChat(chatId) {
+  if (chatAbort[chatId]) chatAbort[chatId].abort()
+  updateChat(chatId, (cur) => {
+    cur.messages = []
+    cur.route = null
+    return cur
+  })
 }
 
 // ---------- 小窗口展开前的让位 ----------
@@ -347,14 +387,12 @@ function openPanelWithRoom() {
 }
 function openFileInPanel(path) {
   openPanelWithRoom()
-  setPaneMode('file')
-  if (panelFileDispatch) panelFileDispatch(path)
-  else if (nativeOpenPath) nativeOpenPath(path)
+  openFileTab(path)
 }
 // 目录引用点击（如「在文件夹中显示」）：面板树直接定位到该目录
 function openDirInPanel(path) {
   openPanelWithRoom()
-  setPaneMode('file')
+  ensureFilesTab()
   if (panelDirDispatch) panelDirDispatch(path)
   else if (nativeOpenPath) nativeOpenPath(path)
 }
@@ -435,6 +473,16 @@ function injectToggleStyle() {
     '.fsviewer-tab-divider{flex:0 0 auto;width:1px;height:14px;' +
     'background:var(--dsw-alias-border-l1);margin:0 2px}' +
     '.fsviewer-tab svg{flex:0 0 auto}' +
+    // 「+」新建页签菜单（浏览器/文件/侧边聊天）
+    '.fsviewer-plus-menu{position:fixed;z-index:60;min-width:200px;padding:4px;border-radius:10px;' +
+    'border:1px solid ' + V.line + ';background:var(--dsw-specific-sidebar-fill);' +
+    'box-shadow:0 8px 24px rgba(0,0,0,.28)}' +
+    '.fsviewer-plus-item{display:flex;align-items:center;gap:8px;width:100%;padding:7px 10px;' +
+    'border:none;background:transparent;border-radius:6px;color:var(--dsw-alias-label-primary);' +
+    'font-size:12.5px;cursor:pointer;font-family:inherit}' +
+    '.fsviewer-plus-item:hover{background:var(--dsw-alias-interactive-bg-hover)}' +
+    '.fsviewer-plus-item svg{flex:0 0 auto;color:var(--dsw-alias-label-secondary)}' +
+    '.fsviewer-plus-hint{color:var(--dsw-alias-label-secondary);font-size:11px}' +
     // 侧边聊天（面板内页签视图，充满 details 列）
     '.fsviewer-chat-scroll{flex:1 1 auto;overflow-y:auto;overflow-x:hidden;padding:12px 14px;' +
     'display:flex;flex-direction:column;gap:10px;min-height:0}' +
@@ -615,21 +663,10 @@ function initState() {
     expanded: {},         // path -> true（已展开）
     branches: {},         // path -> { status:'new'|'ok'|'err', entries, truncated, error }
     term: '',
-    tabs: [],             // 已打开文件 [{ path, name }]（打开顺序）
-    activePath: null,     // 当前预览文件（null = 空状态）
+    activePath: null,     // 当前预览文件（null = 空状态）——由统一页签仓库派生同步
     files: {},            // path -> { status:'loading'|'ok'|'err', content?, size?, truncated?, binary?, error? }
     sourceMode: false     // md：false=渲染视图，true=源码
   }
-}
-function openFileState(state, path) {
-  const name = baseName(path)
-  const tabs = state.tabs.some((t) => t.path === path)
-    ? state.tabs
-    : [...state.tabs, { path, name }]
-  const files = state.files[path]
-    ? state.files
-    : { ...state.files, [path]: { status: 'loading' } }
-  return { ...state, tabs, activePath: path, files, sourceMode: false }
 }
 function reducer(state, action) {
   switch (action.type) {
@@ -676,20 +713,11 @@ function reducer(state, action) {
       return { ...state, branches: { ...state.branches, [action.path]: { status: 'err', error: action.error } } }
     case 'setTerm':
       return { ...state, term: action.term }
-    case 'openFile':
-      return openFileState(state, action.path)
-    case 'activateTab':
-      return { ...state, activePath: action.path, sourceMode: false }
-    case 'closeTab': {
-      const tabs = state.tabs.filter((t) => t.path !== action.path)
-      const files = { ...state.files }
-      delete files[action.path]
-      if (state.activePath !== action.path) return { ...state, tabs, files }
-      const last = tabs[tabs.length - 1]
-      return last
-        ? { ...state, tabs, files, activePath: last.path }
-        : { ...state, tabs, files, activePath: null }
-    }
+    case 'setActive':
+      // 统一页签仓库派生：激活文件页签 -> 预览；激活 打开文件/聊天/浏览器页签 -> 空状态
+      return { ...state, activePath: action.path || null, sourceMode: false }
+    case 'fileLoading':
+      return { ...state, files: { ...state.files, [action.path]: { status: 'loading' } } }
     case 'fileOk':
       return { ...state, files: { ...state.files, [action.path]: { status: 'ok', content: action.content, size: action.size, truncated: action.truncated, binary: action.binary } } }
     case 'fileErr':
@@ -923,7 +951,7 @@ function TreeColumn({ workspaces, state, dispatch, width, onResizeStart }) {
         return (
           <FileRow key={entry.path} entry={entry} depth={depth}
             active={entry.path === state.activePath}
-            onOpen={() => dispatch({ type: 'openFile', path: entry.path })} />
+            onOpen={() => openFileInPanel(entry.path)} />
         )
       }
       const isExpanded = !!state.expanded[entry.path]
@@ -987,52 +1015,73 @@ function TreeColumn({ workspaces, state, dispatch, width, onResizeStart }) {
   )
 }
 
-// ---------- 页签条（图2 Codex 式统一管理：文件页签 | 侧边聊天 | 浏览器页签 + 新建） ----------
-function TabStrip({ state, dispatch, onClose }) {
-  const pane = usePaneMode()
-  hydrateBrowser()
+// ---------- 页签条（Codex 式统一管理）：打开文件 | 文件页签 | 侧边聊天 | 浏览器页签 | + 菜单 ----------
+// × 只显示在激活页签上（Codex 行为）；「+」弹出菜单新建 浏览器/文件/侧边聊天 三类页签。
+function TabStrip() {
+  hydrateTabs()
   const [, force] = React.useState()
-  React.useEffect(() => subscribeBrowser(() => force({})), [])
+  React.useEffect(() => subscribeTabs(() => force({})), [])
+  const [menu, setMenu] = React.useState(null)   // { top, left } | null
+  const plusRef = React.useRef(null)
+  const openMenu = () => {
+    const r = plusRef.current.getBoundingClientRect()
+    setMenu({ top: r.bottom + 6, left: Math.max(8, Math.min(r.left - 8, window.innerWidth - 210)) })
+  }
+  const firstBrowser = tabs.find((t) => t.kind === 'browser')
+  const tabLabel = (t) => {
+    if (t.kind === 'files') return '打开文件'
+    if (t.kind === 'chat') return '侧边聊天'
+    if (t.kind === 'file') return baseName(t.path)
+    return (browserById[t.id] && browserById[t.id].title) || '新标签页'
+  }
+  const tabIcon = (t) => {
+    if (t.kind === 'files') return <IconFileLine />
+    if (t.kind === 'chat') return <IconChatBubble />
+    if (t.kind === 'browser') return <IconGlobe />
+    return null
+  }
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 4, flex: '1 1 auto', minWidth: 0, overflowX: 'auto', padding: '6px 0 6px 8px' }}>
-      {state.tabs.length === 0
-        ? (
-          <span className={'fsviewer-tab' + (pane === 'file' ? ' fsviewer-tab--active' : '')} title="未打开文件">
-            <IconFileLine />
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>打开文件</span>
-            <span onClick={(e) => { e.stopPropagation(); onClose() }} title="关闭面板" style={{ opacity: 0.7, padding: '0 1px' }}>×</span>
-          </span>
+      {tabs.map((t) => {
+        const active = t.id === activeTabId
+        return (
+          <React.Fragment key={t.id}>
+            {t.kind === 'browser' && firstBrowser && firstBrowser.id === t.id && tabs[0].kind !== 'browser'
+              ? <span className="fsviewer-tab-divider" />
+              : null}
+            <span className={'fsviewer-tab' + (active ? ' fsviewer-tab--active' : '')}
+              onClick={() => activateTab(t.id)}
+              title={t.kind === 'file' ? t.path : tabLabel(t)}>
+              {tabIcon(t)}
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{tabLabel(t)}</span>
+              {active
+                ? <span onClick={(e) => { e.stopPropagation(); closeTab(t.id) }}
+                  title="关闭页签" style={{ opacity: 0.7, padding: '0 1px' }}>×</span>
+                : null}
+            </span>
+          </React.Fragment>
         )
-        : state.tabs.map((tab) => (
-          <span key={tab.path}
-            className={'fsviewer-tab' + (pane === 'file' && tab.path === state.activePath ? ' fsviewer-tab--active' : '')}
-            onClick={() => { dispatch({ type: 'activateTab', path: tab.path }); setPaneMode('file') }}
-            title={tab.path}>
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{tab.name}</span>
-            <span onClick={(e) => { e.stopPropagation(); dispatch({ type: 'closeTab', path: tab.path }) }}
-              title="关闭页签" style={{ opacity: 0.7, padding: '0 1px' }}>×</span>
-          </span>
-        ))}
-      {/* 侧边聊天：常驻页签（带图标、无 ×，同图2） */}
-      <span className="fsviewer-tab-divider" />
-      <span className={'fsviewer-tab' + (pane === 'chat' ? ' fsviewer-tab--active' : '')}
-        title="侧边聊天（⌥⌘S）" onClick={() => setPaneMode('chat')}>
-        <IconChatBubble />
-        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>侧边聊天</span>
-      </span>
-      {/* 浏览器页签（多开，globe 图标 + ×） */}
-      {browserTabs.map((t) => (
-        <span key={t.id}
-          className={'fsviewer-tab' + (pane === 'browser' && t.id === activeBrowserTabId ? ' fsviewer-tab--active' : '')}
-          title={t.url || '新标签页'}
-          onClick={() => activateBrowserTab(t.id)}>
-          <IconGlobe />
-          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.title}</span>
-          <span onClick={(e) => { e.stopPropagation(); closeBrowserTab(t.id) }}
-            title="关闭页签" style={{ opacity: 0.7, padding: '0 1px' }}>×</span>
-        </span>
-      ))}
-      <span className="fsviewer-tab" title="新建浏览器页签" onClick={() => newBrowserTab()}>+</span>
+      })}
+      <span ref={plusRef} className="fsviewer-tab" title="新建页签"
+        onClick={() => (menu ? setMenu(null) : openMenu())}>+</span>
+      {menu
+        ? (
+          <>
+            <div style={{ position: 'fixed', inset: 0, zIndex: 59 }} onClick={() => setMenu(null)} />
+            <div className="fsviewer-plus-menu" style={{ top: menu.top, left: menu.left }}>
+              <button type="button" className="fsviewer-plus-item" onClick={() => { setMenu(null); openPanelWithRoom(); newBrowserTab() }}>
+                <IconGlobe /><span style={{ flex: '1 1 auto', textAlign: 'left' }}>浏览器</span><span className="fsviewer-plus-hint">⌥⌘T</span>
+              </button>
+              <button type="button" className="fsviewer-plus-item" onClick={() => { setMenu(null); openPanelWithRoom(); ensureFilesTab() }}>
+                <IconFileLine /><span style={{ flex: '1 1 auto', textAlign: 'left' }}>文件</span><span className="fsviewer-plus-hint">⌘P</span>
+              </button>
+              <button type="button" className="fsviewer-plus-item" onClick={() => { setMenu(null); openPanelWithRoom(); newChatTab() }}>
+                <IconChatBubble /><span style={{ flex: '1 1 auto', textAlign: 'left' }}>侧边聊天</span><span className="fsviewer-plus-hint">⌥⌘S</span>
+              </button>
+            </div>
+          </>
+        )
+        : null}
     </div>
   )
 }
@@ -1043,18 +1092,23 @@ function FileTreePanel({ workspaces, sessions }) {
 
   // 注册程序化打开入口：会话内点击文件引用经此在面板中预览
   React.useEffect(() => {
-    panelFileDispatch = (p) => dispatch({ type: 'openFile', path: p })
+    panelFileDispatch = (p) => openFileTab(p)
     panelDirDispatch = (p) => dispatch({ type: 'gotoRoot', root: p })
     return () => { panelFileDispatch = null; panelDirDispatch = null }
   }, [dispatch])
+  // 统一页签仓库 -> 激活文件派生：激活文件页签时预览该文件，激活其余页签时清空预览
+  const activeTab = useActiveTab()
+  React.useEffect(() => {
+    const p = activeTab && activeTab.kind === 'file' ? activeTab.path : null
+    if (p !== state.activePath) dispatch({ type: 'setActive', path: p })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, state.activePath])
+
   // 右栏可见性：原生列收起时宽度为 0（仍挂载）——宽度 > 80px 视为展开，才加载数据
   const [visible, setVisible] = React.useState(false)
   // 树栏宽度（模块级记忆）；树栏开关
   const [treeW, setTreeW] = React.useState(treeWidth)
   const [treeOn, setTreeOn] = React.useState(true)
-
-  // 空状态伪页签的 ×：收起面板（收起原生右栏）
-  const onClose = () => closePanel()
 
   // 跟踪原生右栏列宽 → 可见性
   React.useEffect(() => {
@@ -1148,11 +1202,14 @@ function FileTreePanel({ workspaces, sessions }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.expanded])
 
-  // 当前激活文件处于 loading -> 拉取内容（迟到的旧响应丢弃）
+  // 当前激活文件缺内容 -> 标记 loading 并拉取（已 ok/err 走缓存；迟到的旧响应丢弃）
   React.useEffect(() => {
     const path = state.activePath
-    if (!path || !state.files[path] || state.files[path].status !== 'loading') return
+    if (!path) return
+    const entry = state.files[path]
+    if (entry && entry.status !== 'loading') return
     let alive = true
+    if (!entry) dispatch({ type: 'fileLoading', path })
     fetchFile(path).then(
       (f) => { if (alive) dispatch({ type: 'fileOk', path, content: f.content, size: f.size, truncated: !!f.truncated, binary: !!f.binary }) },
       (e) => { if (alive) dispatch({ type: 'fileErr', path, error: humanError(e) }) }
@@ -1210,7 +1267,7 @@ function FileTreePanel({ workspaces, sessions }) {
   }
 
   const activeFile = state.activePath ? state.files[state.activePath] : null
-  const pane = usePaneMode()
+  const kind = activeTab ? activeTab.kind : 'files'
   const showSourceBtn = !!(state.activePath && isMdFile(baseName(state.activePath)) && activeFile && activeFile.status === 'ok' && !activeFile.binary)
   // ⧉ 打开 = 在系统文件管理器中打开文件所在文件夹（macOS：Finder）
   const dirOf = (p) => { const i = p.lastIndexOf('/'); return i <= 0 ? '/' : p.slice(0, i) }
@@ -1231,18 +1288,18 @@ function FileTreePanel({ workspaces, sessions }) {
       fontFamily: V.font,
       fontSize: '13px'
     }}>
-      {/* 行1：统一页签条（文件 | 侧边聊天 | 浏览器页签 + 新建）… ⤢ 加宽/还原 */}
+      {/* 行1：统一页签条（打开文件 | 文件页签 | 侧边聊天 | 浏览器页签 | +菜单）… ⤢ 加宽/还原 */}
       <div style={{ display: 'flex', alignItems: 'center', minHeight: 56, borderBottom: '1px solid ' + V.line, flex: '0 0 auto', paddingRight: 6 }}>
-        <TabStrip state={state} dispatch={dispatch} onClose={onClose} />
+        <TabStrip />
         <div style={{ display: 'flex', alignItems: 'center', marginLeft: 'auto', flex: '0 0 auto' }}>
           <button type="button" onClick={toggleWide} data-tip={wide ? '恢复默认宽度' : '加宽面板（最大 520px）'} aria-label="切换加宽"
             className={'fsviewer-iconbtn fsviewer-tip' + (wide ? ' fsviewer-iconbtn--active' : '')}><IconMaximize /></button>
         </div>
       </div>
-      {pane === 'chat' ? (
-        <ChatPanel />
-      ) : pane === 'browser' ? (
-        <BrowserPane />
+      {kind === 'chat' ? (
+        <ChatPanel chatId={activeTab.id} />
+      ) : kind === 'browser' ? (
+        <BrowserPane tabId={activeTab.id} />
       ) : (
         <>
         {/* 行2：面包屑 … 查看源代码 / 文件夹（收展树栏）/ 打开。右边距与行1一致，文件夹与 ⤢ 右缘对齐 */}
@@ -1292,13 +1349,12 @@ function browserTitle(url) {
   if (!url) return '新标签页'
   try { return new URL(url).hostname || url } catch { return url }
 }
-function BrowserPane() {
-  hydrateBrowser()
+function BrowserPane({ tabId }) {
   const [, force] = React.useState()
-  React.useEffect(() => subscribeBrowser(() => force({})), [])
-  const active = browserTabs.find((t) => t.id === activeBrowserTabId)
+  React.useEffect(() => subscribeTabs(() => force({})), [])
+  const active = browserById[tabId]
   if (!active) return null
-  const patch = (fn) => updateBrowserTab(active.id, fn)
+  const patch = (fn) => updateBrowser(tabId, fn)
   const navigate = (raw) => {
     const url = normalizeUrl(raw)
     if (!url) return
@@ -1340,33 +1396,37 @@ function BrowserPane() {
           代理 = 内容经本源服务，绝不能放行 allow-same-origin（否则代理页面获得
           本应用全部权限），代价是页面 storage 不可用（文档站为主，可接受）。 */}
       <div style={{ flex: '1 1 auto', position: 'relative', minHeight: 0 }}>
-        {browserTabs.map((t) => (
-          <iframe
-            key={t.id + '#' + t.reload}
-            src={t.url ? (t.proxy ? '/fsviewer-api/p/' + t.url : t.url) : 'about:blank'}
-            title={t.title}
-            sandbox={t.proxy
-              ? 'allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox'
-              : 'allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-same-origin'}
-            style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', border: 'none',
-              display: t.id === activeBrowserTabId ? 'block' : 'none', backgroundColor: '#fff' }} />
-        ))}
+        {tabs.filter((t) => t.kind === 'browser').map((t) => {
+          const b = browserById[t.id]
+          if (!b) return null
+          return (
+            <iframe
+              key={t.id + '#' + b.reload}
+              src={b.url ? (b.proxy ? '/fsviewer-api/p/' + b.url : b.url) : 'about:blank'}
+              title={b.title}
+              sandbox={b.proxy
+                ? 'allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox'
+                : 'allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-same-origin'}
+              style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', border: 'none',
+                display: t.id === tabId ? 'block' : 'none', backgroundColor: '#fff' }} />
+          )
+        })}
       </div>
     </div>
   )
 }
 
-// ---------- 侧边聊天：会话头入口按钮（打开面板并激活聊天页签） ----------
+// ---------- 侧边聊天：会话头入口按钮（打开面板并跳到最近的聊天页签，无则新建） ----------
 function ChatToggleButton() {
   const open = usePanelOpen()
-  const pane = usePaneMode()
+  const active = useActiveTab()
   return (
     <button
       type="button"
       aria-label="侧边聊天"
       title="侧边聊天（⌥⌘S）"
-      className={'fsviewer-toggle' + (open && pane === 'chat' ? ' fsviewer-toggle--active' : '')}
-      onClick={() => { openPanelWithRoom(); setPaneMode('chat') }}
+      className={'fsviewer-toggle' + (open && active && active.kind === 'chat' ? ' fsviewer-toggle--active' : '')}
+      onClick={() => { openPanelWithRoom(); activateLatestChat() }}
     >
       <IconChatBubble />
     </button>
@@ -1387,54 +1447,55 @@ function ChatMessage({ m }) {
     </div>
   )
 }
-function ChatPanel() {
-  hydrateChat()
+function ChatPanel({ chatId }) {
+  hydrateTabs()
   const [, force] = React.useState()
-  React.useEffect(() => subscribeChat(() => force({})), [])
+  React.useEffect(() => subscribeTabs(() => force({})), [])
+  const chat = getChat(chatId)
   const fileCtx = useCurrentFileCtx()
   const [quote, setQuote] = React.useState(false)
   const [text, setText] = React.useState('')
   const endRef = React.useRef(null)
   // 消息尾部增长时贴底滚动（新消息/增量都触发）
-  const tail = chatStore.messages[chatStore.messages.length - 1]
+  const tail = chat.messages[chat.messages.length - 1]
   const tailLen = tail ? tail.content.length + (tail.reasoning ? tail.reasoning.length : 0) : 0
   React.useEffect(() => {
     const el = endRef.current
     if (el) el.scrollIntoView({ block: 'end' })
-  }, [chatStore.messages.length, tailLen, chatStore.streaming])
+  }, [chat.messages.length, tailLen, chat.streaming])
   const submit = () => {
     const t = text
-    if (!t.trim() || chatStore.streaming) return
+    if (!t.trim() || chat.streaming) return
     setText('')
     const quoted = quote && fileCtx && !fileCtx.binary
       ? { path: fileCtx.path, content: fileCtx.content, truncated: fileCtx.truncated }
       : null
     if (quote) setQuote(false)
-    sendChat(t, quoted)
+    sendChat(chatId, t, quoted)
   }
   return (
     <div style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', minHeight: 0, minWidth: 0, fontFamily: V.font }}>
-      {/* 头：模型路由 + 清空（页签负责标题/切换，无需关闭按钮） */}
+      {/* 头：模型路由 + 清空（页签负责标题/切换/关闭） */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 8px 8px 14px', borderBottom: '1px solid ' + V.line, flex: '0 0 auto' }}>
-        {chatStore.route
-          ? <span title={chatStore.route.provider + ' / ' + chatStore.route.model}
+        {chat.route
+          ? <span title={chat.route.provider + ' / ' + chat.route.model}
             style={{ fontSize: 11, color: V.muted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: '1 1 auto', minWidth: 0 }}>
-            {chatStore.route.model}</span>
+            {chat.route.model}</span>
           : <span style={{ flex: '1 1 auto' }} />}
-        <button type="button" onClick={clearChat} className="fsviewer-iconbtn fsviewer-tip" data-tip="清空对话" aria-label="清空对话"
+        <button type="button" onClick={() => clearChat(chatId)} className="fsviewer-iconbtn fsviewer-tip" data-tip="清空对话" aria-label="清空对话"
           style={{ width: 28, height: 28, fontSize: 15, lineHeight: 1 }}>⌫</button>
       </div>
       {/* 消息列表 */}
       <div className="fsviewer-chat-scroll">
-        {chatStore.messages.length === 0
+        {chat.messages.length === 0
           ? (
             <div style={{ margin: 'auto', textAlign: 'center', color: V.muted, fontSize: 12, display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'center' }}>
               <IconChatBubble />
               <div>向模型提问，可引用当前查看的文件</div>
-              <div style={{ fontSize: 11 }}>⌥⌘S 开合 · 直连 dsh 已配置的模型</div>
+              <div style={{ fontSize: 11 }}>临时会话 · 直连 dsh 已配置的模型</div>
             </div>
           )
-          : chatStore.messages.map((m, i) => <ChatMessage key={i} m={m} />)}
+          : chat.messages.map((m, i) => <ChatMessage key={i} m={m} />)}
         <div ref={endRef} />
       </div>
       {/* 引用当前文件 + 输入区 */}
@@ -1462,8 +1523,8 @@ function ChatPanel() {
             }}
             style={{ flex: '1 1 auto', minWidth: 0, resize: 'none', boxSizing: 'border-box', padding: '7px 9px', backgroundColor: V.input, border: '1px solid ' + V.line, borderRadius: 8, color: V.fg, fontSize: 13, lineHeight: 1.45, fontFamily: V.font }}
           />
-          {chatStore.streaming
-            ? <button type="button" onClick={stopChat} title="停止生成"
+          {chat.streaming
+            ? <button type="button" onClick={() => stopChat(chatId)} title="停止生成"
               style={{ cursor: 'pointer', flex: '0 0 auto', height: 32, fontSize: 12, padding: '0 12px', borderRadius: 8, border: '1px solid ' + V.line, background: 'transparent', color: V.fg }}>停止</button>
             : <button type="button" onClick={submit} disabled={!text.trim()} title="发送"
               style={{ cursor: text.trim() ? 'pointer' : 'default', flex: '0 0 auto', height: 32, fontSize: 12, padding: '0 12px', borderRadius: 8, border: '1px solid ' + V.line, background: text.trim() ? 'var(--dsw-alias-interactive-bg-active)' : 'transparent', color: V.fg, opacity: text.trim() ? 1 : 0.5 }}>发送</button>}
@@ -1474,19 +1535,23 @@ function ChatPanel() {
 }
 // ---------- 快捷键（dsh 无原生快捷键注册 API，自行 DOM 监听） ----------
 // 用 e.code 而非 e.key：macOS ⌥ 组合会把 key 变成特殊字符（⌥S -> 'ß'）。
-// ⌥⌘S 开合侧边聊天（与 Codex 一致）；⌥⌘T 内容列切浏览器并展开（⌘T 留给浏览器本体）。
+// ⌥⌘S = 最近聊天页签（无则新建，Codex 同键）；⌥⌘T = 新建浏览器页签；⌘P = 打开文件页签。
 function installShortcuts() {
   if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return
   window.addEventListener('keydown', (e) => {
-    if (!e.metaKey || !e.altKey || e.ctrlKey || e.shiftKey) return
-    if (e.code === 'KeyS') {
+    if (!e.metaKey || e.ctrlKey || e.shiftKey) return
+    if (e.altKey && e.code === 'KeyS') {
       e.preventDefault()
       openPanelWithRoom()
-      setPaneMode('chat')
-    } else if (e.code === 'KeyT') {
+      activateLatestChat()
+    } else if (e.altKey && e.code === 'KeyT') {
       e.preventDefault()
       openPanelWithRoom()
       newBrowserTab()
+    } else if (!e.altKey && e.code === 'KeyP') {
+      e.preventDefault()
+      openPanelWithRoom()
+      ensureFilesTab()
     }
   })
 }
