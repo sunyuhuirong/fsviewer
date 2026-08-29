@@ -15,15 +15,16 @@
 主机半边只在 `dsh web` 启动时加载。改完安装配置或重新构建后，**必须重启 dsh web**；
 只改浏览器端代码（src/client.js → npm run build）时刷新页面即可。
 
-## 重要 2：本插件依赖 browse 目录能力
+## 重要 2：browse 目录能力不再需要
 
-`fsviewer` 的「选择目录 / 系统打开」来自 `host.listDirectory` 等 browse 能力。dsh 默认的
-`directory-picker-auto` 在**本地 macOS/Windows 启动**时会解析为 native 后端
-（只弹系统选框，不支持目录列举），导致相关功能报错
-`host.listDirectory needs the browse capability`。
+文件的列举与内容读取由插件自带的 host 半边完成：它经官方 `ctx.webServer` 注册
+`/fsviewer-api/list`、`/fsviewer-api/file` 两个路由，直接用 Node `fs` 读取本机文件，
+**不依赖 dsh 的 browse 目录能力**。
 
-因此安装时需按官方换装点把目录选择器固定为 browse 后端（见下面第 3 步）。
-副作用：全应用的「选择目录」交互会从系统弹窗变为应用内对话框。
+「系统打开」（面板内 ⧉）走 `workspaces.openPath`（宿主原生打开文件），同样不依赖 browse。
+
+因此 dsh 的 `directory-picker` / browse 后端配置**对本插件没有任何影响**，下面原来的第 3 步
+现在可以跳过（它只会影响其他用到 dsh 目录选择器的功能）。
 
 ## 安装步骤
 
@@ -67,9 +68,11 @@ cd ~/.dsh/profiles/web && pnpm install
       name: 'fsviewer'
 ```
 
-### 3. 在 profile 补丁层固定 browse 目录后端
+### 3.（可跳过）固定 browse 目录后端
 
-编辑 `~/.dsh/profiles/web/cordis.patch.yml`（顶层是 YAML 数组）：
+本插件不调用 dsh 的目录选择器，故该配置对 fsviewer 无作用，**直接跳过即可**。
+若你出于其他插件的需要仍要固定 browse 后端，编辑 `~/.dsh/profiles/web/cordis.patch.yml`
+（顶层是 YAML 数组）：
 
 ```yaml
 - id: directory-picker
@@ -82,7 +85,7 @@ cd ~/.dsh/profiles/web && pnpm install
       name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'
 ```
 
-> 提示：手动编辑 YAML 时用两个空格缩进，不要用 Tab；改坏了删掉刚加的几行即可恢复。
+> 提示：手动编辑 YAML 用两个空格缩进，不要用 Tab；改坏删掉这几行即可恢复。
 
 ### 4. 重启 dsh web
 
@@ -106,9 +109,9 @@ dsh web
 | 现象 | 可能原因与处理 |
 |------|----------------|
 | 没有出现「右侧栏」按钮 | `dsh.profile.bundles` 没加 `fsviewer`；`node_modules/fsviewer` 链接丢失（重新 `pnpm install` 或手工重建链接）；改完忘记重启；当前在空白首页（需先进入一个会话） |
-| 面板显示「未检测到 workspace 根目录」 | 稍等片刻（列表异步装载）或用「📂 选择目录」手动指定根目录 |
+| 面板显示「未检测到 workspace 根目录」 | 确保已进入一个会话且该会话有工作目录（cwd）或已配置 workspace；面板默认根优先取当前会话 cwd，回退到最近 workspace；本插件无手动选择目录入口 |
 | 点击文件预览报网络异常 | 主机半边未加载：确认 `dsh web` 启动日志有 `[fsviewer] Host routes ready`；没有则重启 dsh web |
-| 「选择目录/打开」报 `needs the browse capability` | browse 后端配置（第 3 步）缺失或写错 |
+| 点 ⧉ 打开无反应 / 报错 | `workspaces.openPath` 需宿主环境支持；确认 `dsh web` 启动正常且宿主提供该能力 |
 | 改了代码不生效 | `npm run build` 后：只改了 src/client.js 刷新页面即可；动过 src/index.js 必须重启 dsh web |
 
 ## 从源码构建
