@@ -880,7 +880,12 @@ function FileTreePanel({ workspaces, sessions }) {
 
   const activeFile = state.activePath ? state.files[state.activePath] : null
   const showSourceBtn = !!(state.activePath && isMdFile(baseName(state.activePath)) && activeFile && activeFile.status === 'ok' && !activeFile.binary)
-  const openFileInSystem = () => { if (state.activePath && nativeOpenPath) nativeOpenPath(state.activePath).catch((e) => console.error('[fsviewer] openPath:', e)) }
+  // ⧉ 打开 = 在系统文件管理器中打开文件所在文件夹（macOS：Finder）
+  const dirOf = (p) => { const i = p.lastIndexOf('/'); return i <= 0 ? '/' : p.slice(0, i) }
+  const openFolderInSystem = () => {
+    if (state.activePath && nativeOpenPath) nativeOpenPath(dirOf(state.activePath)).catch((e) => console.error('[fsviewer] openPath:', e))
+  }
+  const openFolderTip = /Mac/i.test(navigator.platform || navigator.userAgent) ? '在 Finder 中打开' : '在文件夹中打开'
 
   return (
     <div style={{
@@ -918,7 +923,7 @@ function FileTreePanel({ workspaces, sessions }) {
           <IconFolder />
         </button>
         {state.activePath
-          ? <button type="button" onClick={openFileInSystem} title="用系统默认应用打开此文件"
+          ? <button type="button" onClick={openFolderInSystem} title={openFolderTip} aria-label={openFolderTip}
             style={{ cursor: 'pointer', flex: '0 0 auto', fontSize: 12, padding: '3px 12px', borderRadius: 6, border: 'none', background: V.accent, color: '#fff' }}>
             ⧉ 打开</button>
           : null}
