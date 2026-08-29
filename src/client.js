@@ -135,10 +135,11 @@ function setExpandedFrame(on) {
   }
 }
 // 颜色全部走宿主主题变量，明暗主题自动适配
+// muted 用 label-secondary（浅色主题下 label-dimmed 对比度过低，文字图标看不清）
 const V = {
   fill: 'var(--dsw-specific-sidebar-fill)',
   fg: 'var(--dsw-alias-label-primary)',
-  muted: 'var(--dsw-alias-label-dimmed)',
+  muted: 'var(--dsw-alias-label-secondary)',
   line: 'var(--dsw-alias-border-l1)',
   edge: 'var(--dsw-alias-border-l2)',
   input: 'var(--dsw-alias-bg-base)',
@@ -421,8 +422,8 @@ function IconFolder15() {
 // ---------- 空状态（未打开任何文件时，预览区居中提示，同 Codex） ----------
 function EmptyState() {
   return (
-    <div style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8, color: V.muted }}>
-      <svg width="44" height="44" viewBox="0 0 16 16" fill="none" aria-hidden="true" style={{ opacity: 0.6 }}>
+    <div style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8, color: 'var(--dsw-alias-label-secondary)' }}>
+      <svg width="44" height="44" viewBox="0 0 16 16" fill="none" aria-hidden="true">
         <path d="M1.5 4.2c0-.9.7-1.6 1.6-1.6h2.8l1.6 1.8h5.4c.9 0 1.6.7 1.6 1.6v5.8c0 .9-.7 1.6-1.6 1.6H3.1c-.9 0-1.6-.7-1.6-1.6V4.2z" stroke="currentColor" strokeLinejoin="round" />
       </svg>
       <div style={{ fontSize: 15, fontWeight: 600, color: V.fg }}>打开文件</div>
