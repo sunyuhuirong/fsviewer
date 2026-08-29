@@ -36,8 +36,38 @@ let layoutApi = null
 let nativeOpenPath = null
 // FileTreePanel 挂载时注册的程序化打开文件入口
 let panelFileDispatch = null
+
+// ---------- 小窗口展开前的让位 ----------
+// 原生让位链：details 先被挤压、再自动关闭（保 center ≥ 640），左栏从不让位。
+// 窗口不够时右栏会被直接算成 0 宽（点开无效果）。与原生 columns 契约一致的常量：
+const CENTER_MIN_PX = 640      // 原生 CENTER_MIN
+const DETAILS_MIN_PX = 300     // 原生 DETAILS_MIN
+const SIDEBAR_RAIL_PX = 56     // 原生 SIDEBAR_COLLAPSED 收起态图标栏
+// 左栏当前实际渲染宽度：读 AppFrame 内联网格第一段；读不到按断点（1024）推断
+function sidebarRenderedWidth() {
+  const col = document.querySelector('[class*="detailsCol"]')
+  const frame = col && col.parentElement
+  const inline = frame && frame.style.gridTemplateColumns
+  if (inline) {
+    const first = parseFloat(inline.split(' ')[0])
+    if (!Number.isNaN(first)) return first
+  }
+  return window.innerWidth > 1024 ? 280 : SIDEBAR_RAIL_PX
+}
+// 右栏展开前调用：左栏展开着、且按当前宽度右栏会被挤到最小宽以下时，
+// 先收起左栏（原生 toggleSidebar 在 >1024 视口写偏好 0，收起为图标栏）。
+// 只在左栏确实处于展开态时触发——收起态（56 图标栏）下再 toggle 会把它展开，反了。
+function ensureRoomForDetails() {
+  if (!layoutApi) return
+  const sidebarW = sidebarRenderedWidth()
+  if (sidebarW > SIDEBAR_RAIL_PX + 8 &&
+      window.innerWidth - sidebarW - CENTER_MIN_PX < DETAILS_MIN_PX) {
+    layoutApi.toggleSidebar()
+  }
+}
 function openFileInPanel(path) {
   setPanelOpen(true)
+  ensureRoomForDetails()
   if (layoutApi) layoutApi.openDetails()
   if (panelFileDispatch) panelFileDispatch(path)
   else if (nativeOpenPath) nativeOpenPath(path)
@@ -55,6 +85,7 @@ function usePanelOpen() {
 function togglePanel() {
   if (panelOpen) { closePanel(); return }
   setPanelOpen(true)
+  ensureRoomForDetails()
   if (layoutApi) layoutApi.openDetails()
 }
 function closePanel() {
