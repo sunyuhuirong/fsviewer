@@ -590,8 +590,9 @@ function setFramePin(px) {
 }
 // 颜色全部走宿主主题变量，明暗主题自动适配
 // muted 用 label-secondary（浅色主题下 label-dimmed 对比度过低，文字图标看不清）
+// fill 对齐主会话背景（主会话消息区/输入卡片同为 bg-base 白底，配阴影浮起）
 const V = {
-  fill: 'var(--dsw-specific-sidebar-fill)',
+  fill: 'var(--dsw-alias-bg-base, #fff)',
   fg: 'var(--dsw-alias-label-primary)',
   muted: 'var(--dsw-alias-label-secondary)',
   line: 'var(--dsw-alias-border-l1)',
@@ -1526,8 +1527,18 @@ function ChatPanel({ chatId }) {
   const [text, setText] = React.useState('')
   const endRef = React.useRef(null)
   const modelBtnRef = React.useRef(null)
+  const taRef = React.useRef(null)
   const [modelMenu, setModelMenu] = React.useState(null)   // { left, bottom } | null
   const [models, setModels] = React.useState(modelsCache)
+  // 输入随内容自动长高（对齐主会话），发送/清空后收缩
+  const autoGrow = (el) => {
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = Math.min(el.scrollHeight, 160) + 'px'
+  }
+  React.useEffect(() => {
+    autoGrow(taRef.current)
+  }, [text])
   // 消息尾部增长时贴底滚动（新消息/增量都触发）
   const tail = chat.messages[chat.messages.length - 1]
   const tailLen = tail ? tail.content.length + (tail.reasoning ? tail.reasoning.length : 0) : 0
@@ -1572,21 +1583,28 @@ function ChatPanel({ chatId }) {
           : chat.messages.map((m, i) => <ChatMessage key={i} m={m} />)}
         <div ref={endRef} />
       </div>
-      {/* Composer（对齐主会话窗口：圆角容器，输入在上，工具行在下） */}
+      {/* Composer（对齐主会话窗口：22px 圆角白卡片 + 同款双层阴影，输入顶部对齐自动长高） */}
       <div style={{ padding: '8px 10px 10px', flex: '0 0 auto' }}>
-        <div style={{ border: '1px solid ' + V.line, borderRadius: 14, backgroundColor: V.input, padding: '4px 8px 6px' }}>
+        <div style={{
+          border: '1px solid rgba(0, 0, 0, 0.1)',
+          borderRadius: 22,
+          backgroundColor: 'var(--dsw-alias-bg-base, #fff)',
+          boxShadow: 'rgba(0, 0, 0, 0.02) 0px 4px 12px 0px, rgba(0, 0, 0, 0.04) 0px 2px 8px 0px',
+          padding: '2px 10px 6px'
+        }}>
           <textarea
+            ref={taRef}
             value={text}
-            rows={2}
+            rows={1}
             placeholder="输入消息，Enter 发送，Shift+Enter 换行"
-            onChange={(e) => setText(e.target.value)}
+            onChange={(e) => { setText(e.target.value); autoGrow(e.target) }}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault()
                 submit()
               }
             }}
-            style={{ display: 'block', width: '100%', boxSizing: 'border-box', resize: 'none', border: 'none', outline: 'none', background: 'transparent', padding: '8px 6px 2px', color: V.fg, fontSize: 13, lineHeight: 1.45, fontFamily: V.font }}
+            style={{ display: 'block', width: '100%', boxSizing: 'border-box', resize: 'none', border: 'none', outline: 'none', background: 'transparent', padding: '12px 6px 0', minHeight: 38, overflow: 'hidden', color: V.fg, fontSize: 13.5, lineHeight: 1.45, fontFamily: V.font }}
           />
           <div style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '2px 2px 0' }}>
             {fileCtx
