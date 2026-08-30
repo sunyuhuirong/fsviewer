@@ -1530,14 +1530,17 @@ function ChatPanel({ chatId }) {
   const taRef = React.useRef(null)
   const [modelMenu, setModelMenu] = React.useState(null)   // { left, bottom } | null
   const [models, setModels] = React.useState(modelsCache)
-  // 输入随内容自动长高（对齐主会话），发送/清空后收缩
+  // 输入随内容自动长高（对齐主会话）；空文本时清掉 inline 高度回到单行
   const autoGrow = (el) => {
     if (!el) return
     el.style.height = 'auto'
     el.style.height = Math.min(el.scrollHeight, 160) + 'px'
   }
   React.useEffect(() => {
-    autoGrow(taRef.current)
+    const el = taRef.current
+    if (!el) return
+    if (!text) { el.style.height = ''; return }
+    autoGrow(el)
   }, [text])
   // 消息尾部增长时贴底滚动（新消息/增量都触发）
   const tail = chat.messages[chat.messages.length - 1]
@@ -1583,13 +1586,13 @@ function ChatPanel({ chatId }) {
           : chat.messages.map((m, i) => <ChatMessage key={i} m={m} />)}
         <div ref={endRef} />
       </div>
-      {/* Composer（对齐主会话窗口：22px 圆角白卡片 + 同款双层阴影，输入顶部对齐自动长高） */}
+      {/* Composer（对齐主会话窗口：与主会话卡片同款主题变量，深浅主题自适应） */}
       <div style={{ padding: '8px 10px 10px', flex: '0 0 auto' }}>
         <div style={{
-          border: '1px solid rgba(0, 0, 0, 0.1)',
+          border: '1px solid var(--dsw-alias-border-l2-darkmode-thin)',
           borderRadius: 22,
-          backgroundColor: 'var(--dsw-alias-bg-base, #fff)',
-          boxShadow: 'rgba(0, 0, 0, 0.02) 0px 4px 12px 0px, rgba(0, 0, 0, 0.04) 0px 2px 8px 0px',
+          background: 'var(--dsw-specific-input-major)',
+          boxShadow: 'var(--dsw-shadow-lv2)',
           padding: '2px 10px 6px'
         }}>
           <textarea
@@ -1604,7 +1607,7 @@ function ChatPanel({ chatId }) {
                 submit()
               }
             }}
-            style={{ display: 'block', width: '100%', boxSizing: 'border-box', resize: 'none', border: 'none', outline: 'none', background: 'transparent', padding: '12px 6px 0', minHeight: 38, overflow: 'hidden', color: V.fg, fontSize: 13.5, lineHeight: 1.45, fontFamily: V.font }}
+            style={{ display: 'block', width: '100%', boxSizing: 'border-box', resize: 'none', border: 'none', outline: 'none', background: 'transparent', padding: '10px 6px 0', overflow: 'hidden', color: V.fg, fontSize: 13.5, lineHeight: 1.45, fontFamily: V.font }}
           />
           <div style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '2px 2px 0' }}>
             {fileCtx
