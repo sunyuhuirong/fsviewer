@@ -15,9 +15,11 @@
  *     × 只显示在激活页签上；「+」弹出菜单新建三类页签；页签条横向滚动隐藏滚动条；
  *     页签与会话 localStorage 持久化（防 HMR/刷新丢失）。
  *
- * 入口：会话头文件按钮（order 50）与聊天按钮（order 51，跳到最近聊天页签）；
- * 快捷键 ⌥⌘S = 最近聊天页签（无则新建）、⌥⌘T = 新建浏览器页签、⌘P = 打开文件页签
- * （⌘T 留给浏览器本体）。dsh 无原生快捷键注册 API，用 e.code DOM 监听。
+ * 入口：会话头文件按钮（order 50）；侧边聊天经 + 菜单或快捷键 ⌥⌘S（最近聊天页签，
+ * 无则新建）、⌥⌘T = 新建浏览器页签、⌘P = 打开文件页签（⌘T 留给浏览器本体）。
+ * 聊天 Composer 对齐主会话窗口：模型选择器（目录来自 GET /fsviewer-api/models，
+ * 选择按页签持久化，未选时跟随 dsh 默认模型）、圆形发送/停止按钮、引用当前文件。
+ * dsh 无原生快捷键注册 API，用 e.code DOM 监听。
  *
  * 数据来源：
  *   - 目录/文件：GET /fsviewer-api/list、/file；聊天：POST /fsviewer-api/chat（SSE）
@@ -66,6 +68,7 @@ function persistTabs() {
     for (const [id, c] of Object.entries(chatById)) {
       chats[id] = {
         route: c.route || null,
+        model: (c.model && c.model.provider && c.model.model) ? { provider: c.model.provider, model: c.model.model } : null,
         messages: c.messages
           .filter((m) => !m.error && typeof m.content === 'string' && m.content.length)
           .slice(-40)
@@ -88,14 +91,15 @@ function hydrateTabs() {
         for (const [id, b] of Object.entries(d.browser || {})) {
           browserById[id] = { title: '新标签页', url: null, input: '', proxy: false, hist: [], idx: -1, reload: 0, ...b }
         }
-        for (const [id, c] of Object.entries(d.chats || {})) {
-          chatById[id] = {
-            route: (c && c.route) || null,
-            messages: (c && Array.isArray(c.messages) ? c.messages : [])
-              .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.length)
-              .slice(-60)
-          }
+      for (const [id, c] of Object.entries(d.chats || {})) {
+        chatById[id] = {
+          route: (c && c.route) || null,
+          model: (c && c.model && c.model.provider && c.model.model) ? { provider: c.model.provider, model: c.model.model } : null,
+          messages: (c && Array.isArray(c.messages) ? c.messages : [])
+            .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.length)
+            .slice(-60)
         }
+      }
         for (const t of tabs) {
           const n = Number(String(t.id).slice(1)) || 0
           if (t.kind === 'file') seq.f = Math.max(seq.f, n)
@@ -248,12 +252,16 @@ async function sendChat(chatId, text, fileCtx) {
   const ctrl = new AbortController()
   chatAbort[chatId] = ctrl
   try {
+    const cur = getChat(chatId)
+    const body = { messages: cur.messages.slice(0, -1).map((m) => ({ role: m.role, content: m.content })) }
+    if (cur.model && cur.model.provider && cur.model.model) {
+      body.provider = cur.model.provider
+      body.model = cur.model.model
+    }
     const res = await fetch('/fsviewer-api/chat', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        messages: getChat(chatId).messages.slice(0, -1).map((m) => ({ role: m.role, content: m.content }))
-      }),
+      body: JSON.stringify(body),
       signal: ctrl.signal
     })
     if (!res.ok || !res.body) {
@@ -314,6 +322,19 @@ function clearChat(chatId) {
     cur.route = null
     return cur
   })
+}
+
+// ---------- 模型目录（GET /fsviewer-api/models，进程内缓存一次） ----------
+let modelsCache = null
+let modelsPending = null
+function loadModels() {
+  if (modelsCache) return Promise.resolve(modelsCache)
+  if (!modelsPending) {
+    modelsPending = fetchJson('/fsviewer-api/models')
+      .then((d) => { modelsCache = d; return d })
+      .finally(() => { modelsPending = null })
+  }
+  return modelsPending
 }
 
 // ---------- 小窗口展开前的让位 ----------
@@ -1480,24 +1501,7 @@ function EmptyTabsState() {
   )
 }
 
-// ---------- 侧边聊天：会话头入口按钮（打开面板并跳到最近的聊天页签，无则新建） ----------
-function ChatToggleButton() {
-  const open = usePanelOpen()
-  const active = useActiveTab()
-  return (
-    <button
-      type="button"
-      aria-label="侧边聊天"
-      title="侧边聊天（⌥⌘S）"
-      className={'fsviewer-toggle' + (open && active && active.kind === 'chat' ? ' fsviewer-toggle--active' : '')}
-      onClick={() => { openPanelWithRoom(); activateLatestChat() }}
-    >
-      <IconChatBubble />
-    </button>
-  )
-}
-
-// ---------- 侧边聊天：停靠面板（shell.overlay 槽位，右缘 380px 全高） ----------
+// ---------- 侧边聊天：消息与输入区（UI 对齐主会话窗口：Composer 内嵌模型选择器） ----------
 function ChatMessage({ m }) {
   if (m.role === 'user') return <div className="fsviewer-chat-user">{m.content}</div>
   const waiting = m.streaming && !m.content && !m.error
@@ -1520,6 +1524,9 @@ function ChatPanel({ chatId }) {
   const [quote, setQuote] = React.useState(false)
   const [text, setText] = React.useState('')
   const endRef = React.useRef(null)
+  const modelBtnRef = React.useRef(null)
+  const [modelMenu, setModelMenu] = React.useState(null)   // { left, bottom } | null
+  const [models, setModels] = React.useState(modelsCache)
   // 消息尾部增长时贴底滚动（新消息/增量都触发）
   const tail = chat.messages[chat.messages.length - 1]
   const tailLen = tail ? tail.content.length + (tail.reasoning ? tail.reasoning.length : 0) : 0
@@ -1527,6 +1534,18 @@ function ChatPanel({ chatId }) {
     const el = endRef.current
     if (el) el.scrollIntoView({ block: 'end' })
   }, [chat.messages.length, tailLen, chat.streaming])
+  const effectiveModel = chat.model || (modelsCache && modelsCache.default) || null
+  const modelLabel = effectiveModel ? effectiveModel.model : '默认模型'
+  const toggleModelMenu = () => {
+    if (modelMenu) return setModelMenu(null)
+    const r = modelBtnRef.current.getBoundingClientRect()
+    setModelMenu({ left: Math.max(8, Math.min(r.left - 8, window.innerWidth - 260)), bottom: window.innerHeight - r.top + 6 })
+    loadModels().then((d) => setModels(d)).catch(() => setModels({ providers: [], default: null }))
+  }
+  const pickModel = (m) => {
+    updateChat(chatId, (cur) => { cur.model = m; return cur })
+    setModelMenu(null)
+  }
   const submit = () => {
     const t = text
     if (!t.trim() || chat.streaming) return
@@ -1539,16 +1558,6 @@ function ChatPanel({ chatId }) {
   }
   return (
     <div style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', minHeight: 0, minWidth: 0, fontFamily: V.font }}>
-      {/* 头：模型路由 + 清空（页签负责标题/切换/关闭） */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 8px 8px 14px', borderBottom: '1px solid ' + V.line, flex: '0 0 auto' }}>
-        {chat.route
-          ? <span title={chat.route.provider + ' / ' + chat.route.model}
-            style={{ fontSize: 11, color: V.muted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: '1 1 auto', minWidth: 0 }}>
-            {chat.route.model}</span>
-          : <span style={{ flex: '1 1 auto' }} />}
-        <button type="button" onClick={() => clearChat(chatId)} className="fsviewer-iconbtn fsviewer-tip" data-tip="清空对话" aria-label="清空对话"
-          style={{ width: 28, height: 28, fontSize: 15, lineHeight: 1 }}>⌫</button>
-      </div>
       {/* 消息列表 */}
       <div className="fsviewer-chat-scroll">
         {chat.messages.length === 0
@@ -1562,18 +1571,9 @@ function ChatPanel({ chatId }) {
           : chat.messages.map((m, i) => <ChatMessage key={i} m={m} />)}
         <div ref={endRef} />
       </div>
-      {/* 引用当前文件 + 输入区 */}
-      <div style={{ borderTop: '1px solid ' + V.line, padding: '8px 10px 10px', flex: '0 0 auto', display: 'flex', flexDirection: 'column', gap: 6 }}>
-        {fileCtx
-          ? (
-            <button type="button" className={'fsviewer-chat-quote' + (quote ? ' on' : '')}
-              title={'引用文件内容作为上下文：' + fileCtx.path}
-              onClick={() => setQuote(!quote)}>
-              📎 引用当前文件：{baseName(fileCtx.path)}{fileCtx.truncated ? '（前 1MB）' : ''}
-            </button>
-          )
-          : null}
-        <div style={{ display: 'flex', alignItems: 'flex-end', gap: 6 }}>
+      {/* Composer（对齐主会话窗口：圆角容器，输入在上，工具行在下） */}
+      <div style={{ borderTop: '1px solid ' + V.line, padding: '8px 10px 10px', flex: '0 0 auto' }}>
+        <div style={{ border: '1px solid ' + V.line, borderRadius: 14, backgroundColor: V.input, padding: '4px 8px 6px' }}>
           <textarea
             value={text}
             rows={2}
@@ -1585,15 +1585,85 @@ function ChatPanel({ chatId }) {
                 submit()
               }
             }}
-            style={{ flex: '1 1 auto', minWidth: 0, resize: 'none', boxSizing: 'border-box', padding: '7px 9px', backgroundColor: V.input, border: '1px solid ' + V.line, borderRadius: 8, color: V.fg, fontSize: 13, lineHeight: 1.45, fontFamily: V.font }}
+            style={{ display: 'block', width: '100%', boxSizing: 'border-box', resize: 'none', border: 'none', outline: 'none', background: 'transparent', padding: '8px 6px 2px', color: V.fg, fontSize: 13, lineHeight: 1.45, fontFamily: V.font }}
           />
-          {chat.streaming
-            ? <button type="button" onClick={() => stopChat(chatId)} title="停止生成"
-              style={{ cursor: 'pointer', flex: '0 0 auto', height: 32, fontSize: 12, padding: '0 12px', borderRadius: 8, border: '1px solid ' + V.line, background: 'transparent', color: V.fg }}>停止</button>
-            : <button type="button" onClick={submit} disabled={!text.trim()} title="发送"
-              style={{ cursor: text.trim() ? 'pointer' : 'default', flex: '0 0 auto', height: 32, fontSize: 12, padding: '0 12px', borderRadius: 8, border: '1px solid ' + V.line, background: text.trim() ? 'var(--dsw-alias-interactive-bg-active)' : 'transparent', color: V.fg, opacity: text.trim() ? 1 : 0.5 }}>发送</button>}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '2px 2px 0' }}>
+            {fileCtx
+              ? (
+                <button type="button" className={'fsviewer-chat-quote' + (quote ? ' on' : '')}
+                  title={'引用文件内容作为上下文：' + fileCtx.path}
+                  onClick={() => setQuote(!quote)}>
+                  📎 {baseName(fileCtx.path)}
+                </button>
+              )
+              : null}
+            <button type="button" onClick={() => clearChat(chatId)} className="fsviewer-iconbtn fsviewer-tip" data-tip="清空对话" aria-label="清空对话"
+              style={{ width: 24, height: 24, fontSize: 14, lineHeight: 1 }}>⌫</button>
+            <span style={{ flex: '1 1 auto' }} />
+            <button type="button" ref={modelBtnRef} onClick={toggleModelMenu}
+              className="fsviewer-chat-quote" title="选择模型"
+              style={{ maxWidth: 170 }}>
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{modelLabel}</span>
+              <svg width="10" height="10" viewBox="0 0 16 16" fill="none" aria-hidden="true" style={{ flex: '0 0 auto' }}>
+                <path d="m4 6 4 4 4-4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+            <button type="button" onClick={chat.streaming ? () => stopChat(chatId) : submit}
+              disabled={!chat.streaming && !text.trim()}
+              title={chat.streaming ? '停止生成' : '发送'}
+              style={{ width: 28, height: 28, borderRadius: '50%', border: 'none', flex: '0 0 auto',
+                cursor: chat.streaming || text.trim() ? 'pointer' : 'default',
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                background: chat.streaming ? 'var(--dsw-alias-interactive-bg-active)' : (text.trim() ? V.accent : 'var(--dsw-alias-interactive-bg-hover)'),
+                color: chat.streaming || text.trim() ? '#fff' : 'var(--dsw-alias-label-secondary)' }}>
+              {chat.streaming
+                ? <span style={{ width: 9, height: 9, borderRadius: 2, background: 'currentColor', display: 'block' }} />
+                : (
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path d="M8 13V3.5M8 3.5 3.8 7.7M8 3.5l4.2 4.2" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                )}
+            </button>
+          </div>
         </div>
       </div>
+      {/* 模型选择菜单（向上弹出） */}
+      {modelMenu
+        ? (
+          <>
+            <div style={{ position: 'fixed', inset: 0, zIndex: 59 }} onClick={() => setModelMenu(null)} />
+            <div className="fsviewer-plus-menu" style={{ left: modelMenu.left, bottom: modelMenu.bottom, top: 'auto', maxHeight: 340, overflowY: 'auto', minWidth: 240 }}>
+              <div style={{ padding: '6px 10px 4px', fontSize: 11, color: V.muted }}>模型</div>
+              <button type="button" className="fsviewer-plus-item" onClick={() => pickModel(null)}>
+                <span style={{ flex: '1 1 auto', textAlign: 'left' }}>默认模型（跟随 dsh 设置）</span>
+                {!chat.model ? <span style={{ color: V.accent }}>✓</span> : null}
+              </button>
+              {(models ? models.providers : []).map((p) => (
+                <React.Fragment key={p.id}>
+                  <div style={{ padding: '6px 10px 2px', fontSize: 11, color: V.muted }}>{p.name}</div>
+                  {p.models.length
+                    ? p.models.map((m) => {
+                      const on = chat.model && chat.model.provider === p.id && chat.model.model === m.id
+                      return (
+                        <button key={m.id} type="button" className="fsviewer-plus-item" onClick={() => pickModel({ provider: p.id, model: m.id })}>
+                          <span style={{ flex: '1 1 auto', textAlign: 'left', overflow: 'hidden', textOverflow: 'ellipsis' }}>{m.name}</span>
+                          {on ? <span style={{ color: V.accent }}>✓</span> : null}
+                        </button>
+                      )
+                    })
+                    : <div style={{ padding: '2px 10px 6px', fontSize: 11, color: V.muted }}>（无可用模型）</div>}
+                </React.Fragment>
+              ))}
+              {models && !models.providers.length
+                ? <div style={{ padding: '6px 10px 8px', fontSize: 12, color: V.muted }}>未发现可用 provider，请先在 dsh 设置中配置模型</div>
+                : null}
+              {!models
+                ? <div style={{ padding: '6px 10px 8px', fontSize: 12, color: V.muted }}>⏳ 加载模型目录…</div>
+                : null}
+            </div>
+          </>
+        )
+        : null}
     </div>
   )
 }
@@ -1653,13 +1723,6 @@ export function apply(ctx) {
     ctx.slots.register(
       { name: 'conversation.session.header.utilities', id: 'fsviewer-toggle', order: 50, label: '文件管理器' },
       (props) => React.createElement(FsToggleButton, props)
-    )
-  )
-  // 聊天入口按钮：文件按钮右侧（order 更大），打开面板并激活聊天页签
-  ctx.slots.inject('conversation.session.header.utilities', () =>
-    ctx.slots.register(
-      { name: 'conversation.session.header.utilities', id: 'fsviewer-chat-toggle', order: 51, label: '侧边聊天' },
-      (props) => React.createElement(ChatToggleButton, props)
     )
   )
   // 文件面板：直接接管原生 details 右栏（影子注册）。single 槽位同优先级冲突，

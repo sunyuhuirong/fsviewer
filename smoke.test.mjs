@@ -60,13 +60,11 @@ const stubCtx = {
 }
 exports.apply(stubCtx)
 
-if (registrations.length !== 3) throw new Error('expected exactly 3 slot registrations, got ' + registrations.length)
+if (registrations.length !== 2) throw new Error('expected exactly 2 slot registrations, got ' + registrations.length)
 const utilReg = registrations.find((r) => r.meta.name === 'conversation.session.header.utilities' && r.meta.id === 'fsviewer-toggle')
-const chatToggleReg = registrations.find((r) => r.meta.name === 'conversation.session.header.utilities' && r.meta.id === 'fsviewer-chat-toggle')
 const detailsReg = registrations.find((r) => r.meta.name === 'details')
 if (!utilReg) throw new Error('missing utilities registration')
 if (utilReg.meta.id !== 'fsviewer-toggle') throw new Error('wrong utilities id: ' + utilReg.meta.id)
-if (!chatToggleReg) throw new Error('missing chat toggle registration')
 if (detailsReg) {
   if (detailsReg.meta.id !== 'fsviewer-panel') throw new Error('wrong details id: ' + detailsReg.meta.id)
   if (detailsReg.meta.priority !== -10) throw new Error('details priority should be -10 (shadow conversation), got ' + detailsReg.meta.priority)

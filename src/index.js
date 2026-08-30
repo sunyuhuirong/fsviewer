@@ -262,6 +262,36 @@ async function handleChat(ctx, req, res) {
   }
 }
 
+/**
+ * GET /fsviewer-api/models —— 侧边聊天模型选择器的目录。
+ * 返回 { providers:[{id,name,models:[{id,name}]}], default:{provider,model}|null }，
+ * 目录来自 ctx.llm.listProviders()/listModels()，默认取 ctx.agentDefaultModel。
+ */
+async function handleModels(ctx, res) {
+  const llm = ctx.llm
+  if (!llm || typeof llm.listProviders !== 'function') {
+    return json(res, 503, { error: 'llm 服务不可用（宿主未提供 ctx.llm）' })
+  }
+  const providers = []
+  for (const p of llm.listProviders()) {
+    let models = []
+    try {
+      models = (await llm.listModels(p.id)).map((m) => ({ id: m.id, name: m.name || m.id }))
+    } catch (e) {
+      models = []   // 单个 provider 目录失败不阻断整体
+    }
+    providers.push({ id: p.id, name: p.name || p.id, models })
+  }
+  let defaults = null
+  try {
+    const sel = ctx.agentDefaultModel && typeof ctx.agentDefaultModel.currentSelection === 'function'
+      ? ctx.agentDefaultModel.currentSelection()
+      : null
+    if (sel && sel.provider && sel.model) defaults = { provider: sel.provider, model: sel.model }
+  } catch { /* 无默认设置则置空 */ }
+  return json(res, 200, { providers, default: defaults })
+}
+
 // ---------- 同源代理（浏览器视图） ----------
 /** 相对/绝对 URL -> 经代理回源的路径；data:/#:/javascript: 等原样返回 null 不改写 */
 function proxiedAttr(rawAttr, docUrl) {
@@ -363,15 +393,16 @@ export function apply(ctx) {
         if (req.method === 'GET' || req.method === 'HEAD') {
           if (path === '/fsviewer-api/list') return await handleList(url, res)
           if (path === '/fsviewer-api/file') return await handleFile(url, res)
+          if (path === '/fsviewer-api/models') return await handleModels(ctx, res)
           if (path.startsWith(PROXY_PREFIX)) return await handleProxy(url, req, res)
         } else if (req.method === 'POST' && path === '/fsviewer-api/chat') {
           return await handleChat(ctx, req, res)
         }
-        return json(res, 405, { error: '不支持的请求：可用 GET /fsviewer-api/list、/file、/p/<URL> 与 POST /fsviewer-api/chat' })
+        return json(res, 405, { error: '不支持的请求：可用 GET /fsviewer-api/list、/file、/models、/p/<URL> 与 POST /fsviewer-api/chat' })
       } catch (e) {
         return json(res, e && e.httpStatus ? e.httpStatus : 500, { error: e && e.message ? e.message : String(e) })
       }
     }
   }), 'fsviewer: /fsviewer-api routes')
-  console.log('[fsviewer] Host routes ready: GET /fsviewer-api/{list,file,p/*}, POST /fsviewer-api/chat')
+  console.log('[fsviewer] Host routes ready: GET /fsviewer-api/{list,file,models,p/*}, POST /fsviewer-api/chat')
 }
