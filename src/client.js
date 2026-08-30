@@ -315,14 +315,6 @@ async function sendChat(chatId, text, fileCtx) {
   }
 }
 function stopChat(chatId) { if (chatAbort[chatId]) chatAbort[chatId].abort() }
-function clearChat(chatId) {
-  if (chatAbort[chatId]) chatAbort[chatId].abort()
-  updateChat(chatId, (cur) => {
-    cur.messages = []
-    cur.route = null
-    return cur
-  })
-}
 
 // ---------- 模型目录（GET /fsviewer-api/models，进程内缓存一次） ----------
 let modelsCache = null
@@ -1572,7 +1564,7 @@ function ChatPanel({ chatId }) {
         <div ref={endRef} />
       </div>
       {/* Composer（对齐主会话窗口：圆角容器，输入在上，工具行在下） */}
-      <div style={{ borderTop: '1px solid ' + V.line, padding: '8px 10px 10px', flex: '0 0 auto' }}>
+      <div style={{ padding: '8px 10px 10px', flex: '0 0 auto' }}>
         <div style={{ border: '1px solid ' + V.line, borderRadius: 14, backgroundColor: V.input, padding: '4px 8px 6px' }}>
           <textarea
             value={text}
@@ -1597,8 +1589,6 @@ function ChatPanel({ chatId }) {
                 </button>
               )
               : null}
-            <button type="button" onClick={() => clearChat(chatId)} className="fsviewer-iconbtn fsviewer-tip" data-tip="清空对话" aria-label="清空对话"
-              style={{ width: 24, height: 24, fontSize: 14, lineHeight: 1 }}>⌫</button>
             <span style={{ flex: '1 1 auto' }} />
             <button type="button" ref={modelBtnRef} onClick={toggleModelMenu}
               className="fsviewer-chat-quote" title="选择模型"
