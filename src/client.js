@@ -878,6 +878,15 @@ function IconChatBubble() {
     </svg>
   )
 }
+// 空状态大图标：气泡内加号（Codex 侧边聊天空状态同款字形，16 viewBox 可无级缩放）
+function IconChatPlus({ size = 40 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <path d="M8 1.8c3.6 0 6.5 2.5 6.5 5.6s-2.9 5.6-6.5 5.6c-.7 0-1.4-.1-2-.3l-3.2 1.2c-.4.1-.7-.2-.6-.6l.7-2.6C1.9 9.7 1.5 8.6 1.5 7.4c0-3.1 2.9-5.6 6.5-5.6z" stroke="currentColor" strokeWidth="0.85" strokeLinejoin="round" />
+      <path d="M8 4.9v4.4M5.8 7.1h4.4" stroke="currentColor" strokeWidth="0.85" strokeLinecap="round" />
+    </svg>
+  )
+}
 function IconArrowLeft() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -1554,10 +1563,10 @@ function ChatPanel({ chatId }) {
       <div className="fsviewer-chat-scroll">
         {chat.messages.length === 0
           ? (
-            <div style={{ margin: 'auto', textAlign: 'center', color: V.muted, fontSize: 12, display: 'flex', flexDirection: 'column', gap: 8, alignItems: 'center' }}>
-              <IconChatBubble />
-              <div>向模型提问，可引用当前查看的文件</div>
-              <div style={{ fontSize: 11 }}>临时会话 · 直连 dsh 已配置的模型</div>
+            <div style={{ margin: 'auto', textAlign: 'center', display: 'flex', flexDirection: 'column', gap: 10, alignItems: 'center', color: V.muted }}>
+              <IconChatPlus size={40} />
+              <div style={{ fontSize: 16, fontWeight: 600, color: V.fg }}>侧边聊天</div>
+              <div style={{ fontSize: 13 }}>侧边聊天是临时聊天，关闭应用后会消失。</div>
             </div>
           )
           : chat.messages.map((m, i) => <ChatMessage key={i} m={m} />)}
