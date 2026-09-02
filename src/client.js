@@ -133,6 +133,10 @@ function activateTab(id) {
   activeTabId = id
   persistTabs(); notifyTabs()
 }
+// 页签可见性：文件页签只属于其工作区，其余页签全局可见
+function tabVisible(t) {
+  return t.kind !== 'file' || !currentWs || !t.ws || t.ws === currentWs
+}
 function closeTab(id) {
   const idx = tabs.findIndex((t) => t.id === id)
   if (idx < 0) return
@@ -141,8 +145,15 @@ function closeTab(id) {
   if (closed.kind === 'browser') delete browserById[id]
   if (closed.kind === 'chat') delete chatById[id]   // 临时会话：关闭即弃
   if (activeTabId === id) {
-    const next = tabs[Math.min(idx, tabs.length - 1)]
-    activeTabId = next ? next.id : null             // 全部关闭 → 空页签状态
+    // 回落到最近的可见页签（其他工作区的隐藏页签不能激活）；无可见 → 空页签状态
+    let best = null
+    let bestDist = Infinity
+    tabs.forEach((t, i) => {
+      if (!tabVisible(t)) return
+      const dist = Math.abs(i - idx)
+      if (dist < bestDist) { bestDist = dist; best = t }
+    })
+    activeTabId = best ? best.id : null
   }
   persistTabs(); notifyTabs()
 }
@@ -1226,7 +1237,9 @@ function TabStrip() {
   }
   const firstBrowser = tabs.find((t) => t.kind === 'browser')
   // 文件页签按当前工作区过滤：其他工作区的文件页签隐藏不删除，切回时恢复
-  const visibleTabs = tabs.filter((t) => t.kind !== 'file' || !currentWs || !t.ws || t.ws === currentWs)
+  const visibleTabs = tabs.filter((t) => tabVisible(t))
+  // 悬停的页签被关闭/隐藏（切工作区、关闭×）时气泡自检隐藏——元素移除不会触发 mouseleave
+  if (pathTip && !visibleTabs.some((t) => t.id === pathTip.id)) setPathTip(null)
   const tabLabel = (t) => {
     // 文件页签显示归属工作区（项目文件夹）前缀：工作区/文件名
     if (t.kind === 'file') {
@@ -1408,6 +1421,8 @@ function FileTreePanel({ workspaces, sessions, sessionId }) {
   // 切换瞬间快照可能滞后（ss.current 未更新），未解析成功就订阅等待数据到达后补跑。
   const lastSession = React.useRef(null)
   React.useEffect(() => {
+    window.__fsvSessEffect = (window.__fsvSessEffect || 0) + 1
+    window.__fsvSessId = sessionId
     if (lastSession.current === null) { lastSession.current = sessionId; return }
     if (lastSession.current === sessionId) return
     lastSession.current = sessionId
@@ -1939,6 +1954,7 @@ export function apply(ctx) {
   injectToggleStyle()
   // 捕获布局服务：顶部按钮开/收原生右栏
   layoutApi = ctx.layout || null
+  if (typeof window !== 'undefined') window.__fsvLayout = layoutApi
   // 捕获会话/工作区服务：打开文件时解析归属工作区
   sessionsSvc = ctx.sessions || null
   workspacesSvc = ctx.workspaces || null
