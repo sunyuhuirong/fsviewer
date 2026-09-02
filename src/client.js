@@ -239,16 +239,19 @@ function snapshotWsState(ws, patch) {
   wsSessions[ws] = Object.assign(getWsSession(ws), patch)
   persistTabs()
 }
-/** 切换工作区：快照旧工作区 → 归属游离文件页签 → 恢复新工作区的激活页签。
+/** 切换工作区：快照旧工作区 → 归属游离文件页签 → 恢复新工作区的激活页签与内容。
+ *  无 ws 标记的文件页签归属于【切换前的工作区】（它们是在那边打开的）；
  *  无记忆的激活页签时落到「打开文件」页签（不落到其他工作区的隐藏文件页签）。 */
 function setWorkspace(root) {
   if (!root || root === currentWs) { currentWs = root || currentWs; return }
-  snapshotWsState(currentWs, { activeTabId })
-  currentWs = root
-  // 历史遗留：无 ws 标记的文件页签归入当前工作区
-  for (const t of tabs) {
-    if (t.kind === 'file' && !t.ws) t.ws = root
+  const prev = currentWs
+  snapshotWsState(prev, { activeTabId })
+  if (prev) {
+    for (const t of tabs) {
+      if (t.kind === 'file' && !t.ws) t.ws = prev
+    }
   }
+  currentWs = root
   const s = getWsSession(root)
   activeTabId = (s && s.activeTabId && tabs.some((t) => t.id === s.activeTabId))
     ? s.activeTabId
