@@ -100,12 +100,20 @@ function hydrateTabs() {
             .slice(-60)
         }
       }
-        for (const t of tabs) {
-          const n = Number(String(t.id).slice(1)) || 0
-          if (t.kind === 'file') seq.f = Math.max(seq.f, n)
-          else if (t.kind === 'chat') seq.c = Math.max(seq.c, n)
-          else if (t.kind === 'browser') seq.b = Math.max(seq.b, n)
+      for (const t of tabs) {
+        const n = Number(String(t.id).slice(1)) || 0
+        if (t.kind === 'file') seq.f = Math.max(seq.f, n)
+        else if (t.kind === 'chat') seq.c = Math.max(seq.c, n)
+        else if (t.kind === 'browser') seq.b = Math.max(seq.b, n)
+      }
+      // 无归属的文件页签归位：优先存储的当前工作区，其次按路径前缀匹配已知工作区
+      for (const t of tabs) {
+        if (t.kind !== 'file' || t.ws) continue
+        if (typeof d.currentWs === 'string' && d.currentWs) { t.ws = d.currentWs; continue }
+        for (const k of Object.keys(wsSessions)) {
+          if (underRoot(t.path, k)) { t.ws = k; break }
         }
+      }
       activeTabId = tabs.some((t) => t.id === d.activeTabId) ? d.activeTabId : tabs[tabs.length - 1].id
       if (d.ws && typeof d.ws === 'object') wsSessions = d.ws
       if (typeof d.currentWs === 'string') currentWs = d.currentWs
@@ -145,6 +153,7 @@ function ensureFilesTab() {
   persistTabs(); notifyTabs()
 }
 function openFileTab(path) {
+  ensureCurrentWs()
   let t = tabs.find((t) => t.kind === 'file' && t.path === path)
   if (!t) { t = { id: mkId('f'), kind: 'file', path, ws: currentWs }; tabs = tabs.concat(t) }
   activeTabId = t.id
@@ -228,6 +237,38 @@ function underRoot(p, root) {
 // 树栏开关与宽度），切换时恢复——等效 Codex 的每工作区独立工作台。
 let wsSessions = {}   // wsRoot -> { activeTabId, panelOpen, expanded, treeOn, treeW }
 let currentWs = null
+// 会话/工作区服务引用（apply 时捕获）：打开文件时解析归属工作区用
+let sessionsSvc = null
+let workspacesSvc = null
+/** 解析当前默认工作区根：会话 cwd 优先，回落 workspaces 最近项 */
+function resolveDefaultRoot() {
+  try {
+    const ss = sessionsSvc && sessionsSvc.list && sessionsSvc.list.getSnapshot()
+    if (ss && ss.current !== undefined && ss.byId) {
+      const rec = ss.byId[ss.current]
+      if (rec && rec.cwd) return rec.cwd
+    }
+    const snap = workspacesSvc && workspacesSvc.list && workspacesSvc.list.getSnapshot()
+    if (snap && snap.items && snap.items.length) {
+      const rec = snap.items.find((w) => w.workspaceId === snap.recentWorkspaceId)
+      const chosen = rec || snap.items[0]
+      if (chosen && chosen.path) return chosen.path
+    }
+  } catch (e) { console.error('[fsviewer] resolve default root:', e) }
+  return null
+}
+/** 打开文件前确保已归属工作区（无法解析时不强制，交由后续切换惰性归属） */
+function ensureCurrentWs() {
+  if (!currentWs) {
+    const root = resolveDefaultRoot()
+    if (root) setWorkspace(root)
+  }
+}
+/** 工作区根 -> 显示名（末级项目文件夹名） */
+function wsDisplayName(root) {
+  const segs = String(root || '').split(/[\\/]+/).filter(Boolean)
+  return segs.length ? segs[segs.length - 1] : ''
+}
 function getWsSession(ws) {
   if (!ws) return null
   if (!wsSessions[ws]) wsSessions[ws] = {}
@@ -589,7 +630,12 @@ function injectToggleStyle() {
     '.fsviewer-plus-menu{position:fixed;z-index:60;min-width:200px;padding:4px;border-radius:10px;' +
     'border:1px solid ' + V.line + ';background:var(--dsw-specific-sidebar-fill);' +
     'box-shadow:0 8px 24px rgba(0,0,0,.28)}' +
-    '.fsviewer-plus-item{display:flex;align-items:center;gap:8px;width:100%;padding:7px 10px;' +
+    // 文件页签悬停路径气泡：fixed 定位逃离页签条滚动裁剪，rtl 让超长路径省略头部、保留文件名端
+    '.fsviewer-tab-path-tip{position:fixed;z-index:61;max-width:min(72vw,560px);overflow:hidden;' +
+    'text-overflow:ellipsis;white-space:nowrap;direction:rtl;text-align:left;' +
+    'background:var(--dsw-alias-label-primary);color:var(--dsw-alias-label-primary-inverted);' +
+    'font-size:12px;line-height:1.4;padding:6px 10px;border-radius:6px;pointer-events:none;' +
+    'box-shadow:0 4px 12px rgba(0,0,0,.18)}' +    '.fsviewer-plus-item{display:flex;align-items:center;gap:8px;width:100%;padding:7px 10px;' +
     'border:none;background:transparent;border-radius:6px;color:var(--dsw-alias-label-primary);' +
     'font-size:12.5px;cursor:pointer;font-family:inherit}' +
     '.fsviewer-plus-item:hover{background:var(--dsw-alias-interactive-bg-hover)}' +
@@ -1168,18 +1214,27 @@ function TabStrip() {
   const [, force] = React.useState()
   React.useEffect(() => subscribeTabs(() => force({})), [])
   const [menu, setMenu] = React.useState(null)   // { top, left } | null
+  const [pathTip, setPathTip] = React.useState(null)   // { text, left, top } | null
   const plusRef = React.useRef(null)
   const openMenu = () => {
     const r = plusRef.current.getBoundingClientRect()
     setMenu({ top: r.bottom + 6, left: Math.max(8, Math.min(r.left - 8, window.innerWidth - 210)) })
   }
+  const showPathTip = (e, text) => {
+    const r = e.currentTarget.getBoundingClientRect()
+    setPathTip({ text, left: Math.max(8, Math.min(r.left, window.innerWidth - 380)), top: r.bottom + 6 })
+  }
   const firstBrowser = tabs.find((t) => t.kind === 'browser')
   // 文件页签按当前工作区过滤：其他工作区的文件页签隐藏不删除，切回时恢复
   const visibleTabs = tabs.filter((t) => t.kind !== 'file' || !currentWs || !t.ws || t.ws === currentWs)
   const tabLabel = (t) => {
+    // 文件页签显示归属工作区（项目文件夹）前缀：工作区/文件名
+    if (t.kind === 'file') {
+      const ws = wsDisplayName(t.ws)
+      return ws ? ws + '/' + baseName(t.path) : baseName(t.path)
+    }
     if (t.kind === 'files') return '打开文件'
     if (t.kind === 'chat') return '侧边聊天'
-    if (t.kind === 'file') return baseName(t.path)
     return (browserById[t.id] && browserById[t.id].title) || '新标签页'
   }
   const tabIcon = (t) => {
@@ -1199,7 +1254,8 @@ function TabStrip() {
               : null}
             <span className={'fsviewer-tab' + (active ? ' fsviewer-tab--active' : '')}
               onClick={() => activateTab(t.id)}
-              title={t.kind === 'file' ? t.path : tabLabel(t)}>
+              onMouseEnter={(e) => { if (t.kind === 'file') showPathTip(e, t.path) }}
+              onMouseLeave={() => setPathTip(null)}>
               {tabIcon(t)}
               <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{tabLabel(t)}</span>
               {active
@@ -1214,6 +1270,11 @@ function TabStrip() {
         ? (
           <span ref={plusRef} className="fsviewer-tab" title="新建页签"
             onClick={() => (menu ? setMenu(null) : openMenu())}>+</span>
+        )
+        : null}
+      {pathTip
+        ? (
+          <div className="fsviewer-tab-path-tip" style={{ left: pathTip.left, top: pathTip.top }}>{pathTip.text}</div>
         )
         : null}
       {menu
@@ -1316,22 +1377,6 @@ function FileTreePanel({ workspaces, sessions, sessionId }) {
   //   2) workspaces 列表（最近优先 -> 首个）
   // 两个存储都是异步装载的（服务重启后面板首开时快照可能还是空的），
   // 因此先立即试一次，未就绪就订阅等数据到达后再落根。
-  const resolveDefaultRoot = () => {
-    try {
-      const ss = sessions.list.getSnapshot()
-      if (ss && ss.current !== undefined && ss.byId) {
-        const rec = ss.byId[ss.current]
-        if (rec && rec.cwd) return rec.cwd
-      }
-      const snap = workspaces.list.getSnapshot()
-      if (snap && snap.items && snap.items.length) {
-        const rec = snap.items.find((w) => w.workspaceId === snap.recentWorkspaceId)
-        const chosen = rec || snap.items[0]
-        if (chosen && chosen.path) return chosen.path
-      }
-    } catch (e) { console.error('[fsviewer] resolve default root:', e) }
-    return null
-  }
   React.useEffect(() => {
     if (!visible || state.root !== undefined) return
     let disposed = false
@@ -1894,6 +1939,9 @@ export function apply(ctx) {
   injectToggleStyle()
   // 捕获布局服务：顶部按钮开/收原生右栏
   layoutApi = ctx.layout || null
+  // 捕获会话/工作区服务：打开文件时解析归属工作区
+  sessionsSvc = ctx.sessions || null
+  workspacesSvc = ctx.workspaces || null
   // 拦截系统打开：会话内点击文件引用改道到插件预览（保留原生打开供面板 ⧉ 使用）。
   // 引用路径不带类型标记，先探测：list 接口对目录返回 200、对文件返回 400「不是目录」——
   // 目录 → 面板树定位到该目录（如「在文件夹中显示」）；文件 → 预览；
