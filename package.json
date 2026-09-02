@@ -1,6 +1,6 @@
 {
   "name": "fsviewer",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Codex-style right-edge workspace for DeepSeek dsh web: file tree + preview, embedded browser (direct/proxy iframe), and side chat via host ctx.llm streaming",
   "type": "module",
   "main": "src/index.js",

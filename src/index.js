@@ -18,7 +18,7 @@
  */
 
 import { open, readdir, readFile, stat } from 'node:fs/promises'
-import { join, resolve as resolvePath } from 'node:path'
+import { isAbsolute, join, resolve as resolvePath, sep } from 'node:path'
 import { BlockAssembler, createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 
 export const name = 'fsviewer'
@@ -55,12 +55,21 @@ function httpError(status, message) {
   return e
 }
 
-/** 绝对路径 -> 面包屑（[{name:'/',path:'/'},{name:'a',path:'/a'},...]） */
+/**
+ * 绝对路径 -> 面包屑（[{name,path},...]）。
+ * 跨平台：POSIX 路径首节点为 '/'；Windows 路径首节点为盘符根（如 'C:\\'）。
+ * 路径片段同时按 '/' 与 '\\' 切分，避免混用分隔符时面包屑塌陷成单节点。
+ */
 function crumbsFor(absPath) {
-  const crumbs = [{ name: '/', path: '/' }]
-  let acc = ''
-  for (const seg of absPath.split('/').filter(Boolean)) {
-    acc += '/' + seg
+  const segs = absPath.split(/[/\\]+/).filter(Boolean)
+  const winDrive = /^[A-Za-z]:$/.test(segs[0])
+  const rootName = winDrive ? segs[0] + sep : '/'
+  const rootPath = winDrive ? segs[0] + sep : sep
+  const crumbs = [{ name: rootName, path: rootPath }]
+  let acc = rootPath
+  const start = winDrive ? 1 : 0
+  for (const seg of segs.slice(start)) {
+    acc = join(acc, seg)
     crumbs.push({ name: seg, path: acc })
   }
   return crumbs
@@ -83,7 +92,8 @@ function decodeStrict(buf) {
 
 async function requireAbsPath(url) {
   const raw = url.searchParams.get('path')
-  if (!raw || !raw.startsWith('/')) throw httpError(400, 'path 必须是绝对路径')
+  // isAbsolute 跨平台：POSIX 接受 '/foo'，Windows 同时接受 'C:\\foo' 与 'C:/foo'
+  if (!raw || !isAbsolute(raw)) throw httpError(400, 'path 必须是绝对路径')
   return resolvePath(raw)
 }
 

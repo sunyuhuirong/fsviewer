@@ -621,6 +621,18 @@ function baseName(p) {
   const segs = String(p || '').split(/[\\/]+/).filter(Boolean)
   return segs.length ? segs[segs.length - 1] : p
 }
+// 取父目录，跨平台：同时识别 '/' 与 '\\' 分隔符。
+// Windows 盘符根（如 'C:\\'）与 POSIX 根（'/'）已到顶，原样返回。
+function parentDir(p) {
+  const s = String(p || '')
+  const segs = s.split(/[\\/]+/).filter(Boolean)
+  const winDrive = segs.length > 0 && /^[A-Za-z]:$/.test(segs[0])
+  // 已位于根：POSIX 无片段；Windows 只剩盘符片段
+  if (segs.length <= (winDrive ? 1 : 0)) return winDrive ? segs[0] + '\\' : '/'
+  segs.pop()
+  if (winDrive) return segs[0] + '\\' + segs.slice(1).join('\\')
+  return '/' + segs.join('/')
+}
 function fmtSize(n) {
   if (n == null) return ''
   if (n < 1024) return n + ' B'
@@ -1334,10 +1346,9 @@ function FileTreePanel({ workspaces, sessions }) {
   const activeFile = state.activePath ? state.files[state.activePath] : null
   const kind = activeTab ? activeTab.kind : 'empty'
   const showSourceBtn = !!(state.activePath && isMdFile(baseName(state.activePath)) && activeFile && activeFile.status === 'ok' && !activeFile.binary)
-  // ⧉ 打开 = 在系统文件管理器中打开文件所在文件夹（macOS：Finder）
-  const dirOf = (p) => { const i = p.lastIndexOf('/'); return i <= 0 ? '/' : p.slice(0, i) }
+  // ⧉ 打开 = 在系统文件管理器中打开文件所在文件夹（macOS：Finder，Windows：资源管理器）
   const openFolderInSystem = () => {
-    if (state.activePath && nativeOpenPath) nativeOpenPath(dirOf(state.activePath)).catch((e) => console.error('[fsviewer] openPath:', e))
+    if (state.activePath && nativeOpenPath) nativeOpenPath(parentDir(state.activePath)).catch((e) => console.error('[fsviewer] openPath:', e))
   }
   const openFolderTip = /Mac/i.test(navigator.platform || navigator.userAgent) ? '在 Finder 中打开' : '在文件夹中打开'
 
@@ -1724,7 +1735,8 @@ export function apply(ctx) {
   if (ctx.workspaces && typeof ctx.workspaces.openPath === 'function') {
     nativeOpenPath = ctx.workspaces.openPath.bind(ctx.workspaces)
     ctx.workspaces.openPath = (path) => {
-      if (typeof path === 'string' && path.length > 0 && !path.endsWith('/')) {
+      // 尾部分隔符（POSIX '/' 或 Windows '\\'）视为目录，直接交原生打开
+      if (typeof path === 'string' && path.length > 0 && !/[\\/]$/.test(path)) {
         fetchList(path).then(
           () => openDirInPanel(path),
           (e) => {
