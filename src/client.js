@@ -75,7 +75,7 @@ function persistTabs() {
           .map((m) => ({ role: m.role, content: m.content }))
       }
     }
-    localStorage.setItem(TABS_KEY, JSON.stringify({ tabs, activeTabId, browser: browserById, chats }))
+    localStorage.setItem(TABS_KEY, JSON.stringify({ tabs, activeTabId, browser: browserById, chats, ws: wsSessions, currentWs }))
   } catch { /* 配额满等忽略 */ }
 }
 function mkId(kind) { return kind + (++seq[kind]) }
@@ -106,8 +106,10 @@ function hydrateTabs() {
           else if (t.kind === 'chat') seq.c = Math.max(seq.c, n)
           else if (t.kind === 'browser') seq.b = Math.max(seq.b, n)
         }
-        activeTabId = tabs.some((t) => t.id === d.activeTabId) ? d.activeTabId : tabs[tabs.length - 1].id
-        return
+      activeTabId = tabs.some((t) => t.id === d.activeTabId) ? d.activeTabId : tabs[tabs.length - 1].id
+      if (d.ws && typeof d.ws === 'object') wsSessions = d.ws
+      if (typeof d.currentWs === 'string') currentWs = d.currentWs
+      return
       }
     }
   } catch { /* 历史损坏按默认 */ }
@@ -144,7 +146,7 @@ function ensureFilesTab() {
 }
 function openFileTab(path) {
   let t = tabs.find((t) => t.kind === 'file' && t.path === path)
-  if (!t) { t = { id: mkId('f'), kind: 'file', path }; tabs = tabs.concat(t) }
+  if (!t) { t = { id: mkId('f'), kind: 'file', path, ws: currentWs }; tabs = tabs.concat(t) }
   activeTabId = t.id
   persistTabs(); notifyTabs()
 }
@@ -220,22 +222,38 @@ function underRoot(p, root) {
   const nr = String(root).replace(/\\/g, '/').replace(/\/+$/, '') || '/'
   return np === nr || np.startsWith(nr + '/')
 }
-// 工作区切换后修剪文件页签：只保留当前工作区根下的文件（其余页签不受影响）
-function pruneFileTabs(root) {
-  if (!root) return
-  let changed = false
-  const next = tabs.filter((t) => {
-    if (t.kind !== 'file') return true
-    if (underRoot(t.path, root)) return true
-    changed = true
-    return false
-  })
-  if (!changed) return
-  tabs = next
-  if (!tabs.some((t) => t.id === activeTabId)) {
-    const files = tabs.find((t) => t.kind === 'files')
-    activeTabId = files ? files.id : (tabs[0] ? tabs[0].id : null)
+// ---------- 按工作区记忆页签会话 ----------
+// 文件页签带 ws（所属工作区根）标记；切换工作区只隐藏其他工作区的文件页签（不删除），
+// 切回时原样恢复（含激活页签）。每个工作区另存一份侧栏状态快照（面板开合、树展开、
+// 树栏开关与宽度），切换时恢复——等效 Codex 的每工作区独立工作台。
+let wsSessions = {}   // wsRoot -> { activeTabId, panelOpen, expanded, treeOn, treeW }
+let currentWs = null
+function getWsSession(ws) {
+  if (!ws) return null
+  if (!wsSessions[ws]) wsSessions[ws] = {}
+  return wsSessions[ws]
+}
+/** 静默快照当前工作区的侧栏状态（只持久化，不触发重渲染） */
+function snapshotWsState(ws, patch) {
+  if (!ws) return
+  wsSessions[ws] = Object.assign(getWsSession(ws), patch)
+  persistTabs()
+}
+/** 切换工作区：快照旧工作区 → 归属游离文件页签 → 恢复新工作区的激活页签 */
+function setWorkspace(root) {
+  if (!root || root === currentWs) { currentWs = root || currentWs; return }
+  snapshotWsState(currentWs, { activeTabId })
+  currentWs = root
+  // 历史遗留：无 ws 标记的文件页签归入当前工作区
+  let assigned = false
+  for (const t of tabs) {
+    if (t.kind === 'file' && !t.ws) { t.ws = root; assigned = true }
   }
+  const s = getWsSession(root)
+  activeTabId = (s && s.activeTabId && tabs.some((t) => t.id === s.activeTabId))
+    ? s.activeTabId
+    : ((tabs.find((t) => t.kind === 'files') || tabs[0] || {}).id ?? null)
+  if (assigned) { /* 已并入 persistTabs */ }
   persistTabs(); notifyTabs()
 }
 function useActiveTab() {
@@ -731,22 +749,10 @@ function SidebarRightIcon() {
 }
 
 // ---------- 顶部切换按钮（注入会话头 utilities，位于 session log 导出按钮右边） ----------
-// session 作用域组件：拿到 sessionId，切换会话时自动收起面板。
-// 点击 = layout.openDetails()/closeDetails()（原生右栏推挤/收起，位置随头部移动、确定可预期）
-function FsToggleButton({ sessionId }) {
+// session 作用域组件：面板开合状态现由工作区记忆接管（切工作区自动恢复开合），
+// 此处仅保留纯开合切换。
+function FsToggleButton() {
   const [open] = usePanelOpen()
-  // null=尚未记录（首帧赋值不算「切换」，避免会话恢复期间误关面板）
-  const lastSession = React.useRef(null)
-  React.useEffect(() => {
-    if (lastSession.current === null) {
-      lastSession.current = sessionId
-      return
-    }
-    if (lastSession.current !== sessionId) {
-      lastSession.current = sessionId
-      closePanel()
-    }
-  }, [sessionId])
   return (
     <button
       type="button"
@@ -835,6 +841,9 @@ function reducer(state, action) {
       return { ...state, files: { ...state.files, [action.path]: { status: 'err', error: action.error } } }
     case 'toggleSource':
       return { ...state, sourceMode: !state.sourceMode }
+    case 'restoreTree':
+      // 工作区切换恢复：还原该工作区的树展开状态（branches 内容缓存保留）
+      return { ...state, expanded: action.expanded || {} }
     default:
       return state
   }
@@ -1158,6 +1167,8 @@ function TabStrip() {
     setMenu({ top: r.bottom + 6, left: Math.max(8, Math.min(r.left - 8, window.innerWidth - 210)) })
   }
   const firstBrowser = tabs.find((t) => t.kind === 'browser')
+  // 文件页签按当前工作区过滤：其他工作区的文件页签隐藏不删除，切回时恢复
+  const visibleTabs = tabs.filter((t) => t.kind !== 'file' || !currentWs || !t.ws || t.ws === currentWs)
   const tabLabel = (t) => {
     if (t.kind === 'files') return '打开文件'
     if (t.kind === 'chat') return '侧边聊天'
@@ -1172,11 +1183,11 @@ function TabStrip() {
   }
   return (
     <div className="fsviewer-tabstrip" style={{ display: 'flex', alignItems: 'center', gap: 4, flex: '1 1 auto', minWidth: 0, overflowX: 'auto', padding: '6px 0 6px 8px' }}>
-      {tabs.map((t) => {
+      {visibleTabs.map((t) => {
         const active = t.id === activeTabId
         return (
           <React.Fragment key={t.id}>
-            {t.kind === 'browser' && firstBrowser && firstBrowser.id === t.id && tabs[0].kind !== 'browser'
+            {t.kind === 'browser' && firstBrowser && firstBrowser.id === t.id && visibleTabs[0].kind !== 'browser'
               ? <span className="fsviewer-tab-divider" />
               : null}
             <span className={'fsviewer-tab' + (active ? ' fsviewer-tab--active' : '')}
@@ -1239,9 +1250,38 @@ function FileTreePanel({ workspaces, sessions, sessionId }) {
   }, [activeTab, state.activePath])
   // 右栏可见性：原生列收起时宽度为 0（仍挂载）——宽度 > 80px 视为展开，才加载数据
   const [visible, setVisible] = React.useState(false)
-  // 树栏宽度（模块级记忆）；树栏开关
+  // 树栏宽度（模块级记忆）；树栏开关；工作区根（区别于树当前浏览目录
+  // state.root——目录引用点击只导航不换工作区）
   const [treeW, setTreeW] = React.useState(treeWidth)
   const [treeOn, setTreeOn] = React.useState(true)
+  const [wsRoot, setWsRoot] = React.useState(null)
+  const panelOpen = usePanelOpen()
+
+  // 工作区切换：恢复该工作区的侧栏状态（面板开合、树展开、树栏开关与宽度）
+  const wsRootRef = React.useRef(null)
+  React.useEffect(() => {
+    if (wsRoot === wsRootRef.current) return
+    const prev = wsRootRef.current
+    wsRootRef.current = wsRoot
+    // 切换前把当前状态快照回旧工作区（连续快照 normally 已覆盖，这里兜底切换瞬间的值）
+    if (prev) snapshotWsState(prev, { panelOpen, expanded: state.expanded, treeOn, treeW })
+    const s = wsRoot ? getWsSession(wsRoot) : null
+    if (s && s.panelOpen != null) {
+      if (s.panelOpen && !panelOpen) openPanelWithRoom()
+      else if (!s.panelOpen && panelOpen) closePanel()
+    }
+    if (s && s.expanded) dispatch({ type: 'restoreTree', expanded: s.expanded })
+    if (s && s.treeOn != null) setTreeOn(s.treeOn)
+    if (s && s.treeW != null) { treeWidth = s.treeW; setTreeW(s.treeW) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wsRoot])
+
+  // 当前工作区的侧栏状态持续快照回写（切换/刷新后可恢复）
+  React.useEffect(() => {
+    if (!wsRoot) return
+    snapshotWsState(wsRoot, { panelOpen, expanded: state.expanded, treeOn, treeW })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wsRoot, panelOpen, state.expanded, treeOn, treeW])
 
   // 跟踪原生右栏列宽 → 可见性
   React.useEffect(() => {
@@ -1284,6 +1324,7 @@ function FileTreePanel({ workspaces, sessions, sessionId }) {
       if (disposed) return true
       if (root !== null) {
         dispatch({ type: 'setRoot', root })
+        setWorkspace(root)
         setWsRoot(root)
         return true
       }
@@ -1301,25 +1342,40 @@ function FileTreePanel({ workspaces, sessions, sessionId }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible])
 
-  // 工作区根（区别于树当前浏览目录 state.root——目录引用点击只导航不换工作区）：
-  // 文件页签只保留该根下的文件，切换工作区后旧文件页签自动清除
-  const [wsRoot, setWsRoot] = React.useState(null)
-  React.useEffect(() => {
-    if (wsRoot) pruneFileTabs(wsRoot)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wsRoot])
-
-  // 会话/工作区切换：重解析根目录（会话 cwd 优先），树与文件页签跟随当前工作区
+  // 会话/工作区切换：重解析根目录（会话 cwd 优先），树与文件页签跟随当前工作区。
+  // 切换瞬间快照可能滞后（ss.current 未更新），未解析成功就订阅等待数据到达后补跑。
   const lastSession = React.useRef(null)
   React.useEffect(() => {
     if (lastSession.current === null) { lastSession.current = sessionId; return }
     if (lastSession.current === sessionId) return
     lastSession.current = sessionId
-    const root = resolveDefaultRoot()
-    if (root) {
+    let disposed = false
+    const unsubs = []
+    const tryApply = () => {
+      const root = resolveDefaultRoot()
+      if (disposed || root === null) return false
       dispatch({ type: 'gotoRoot', root })
+      setWorkspace(root)
       setWsRoot(root)
+      return true
     }
+    if (tryApply()) return
+    const onChange = () => {
+      if (tryApply() && unsubs.length) unsubs.forEach((u) => u())
+    }
+    try {
+      unsubs.push(sessions.list.subscribe(onChange))
+      unsubs.push(workspaces.list.subscribe(onChange))
+    } catch (e) { console.error('[fsviewer] ws switch subscribe:', e) }
+    // 订阅存在竞态（快照可能在订阅前已更新、之后不再 push）：轮询兜底，成功或超时收敛
+    let tries = 0
+    const timer = setInterval(() => {
+      if (disposed || tryApply() || ++tries > 24) {
+        clearInterval(timer)
+        unsubs.forEach((u) => u())
+      }
+    }, 250)
+    return () => { disposed = true; unsubs.forEach((u) => u()) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId])
 
