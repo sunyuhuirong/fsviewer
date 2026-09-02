@@ -239,21 +239,25 @@ function snapshotWsState(ws, patch) {
   wsSessions[ws] = Object.assign(getWsSession(ws), patch)
   persistTabs()
 }
-/** 切换工作区：快照旧工作区 → 归属游离文件页签 → 恢复新工作区的激活页签 */
+/** 切换工作区：快照旧工作区 → 归属游离文件页签 → 恢复新工作区的激活页签。
+ *  无记忆的激活页签时落到「打开文件」页签（不落到其他工作区的隐藏文件页签）。 */
 function setWorkspace(root) {
   if (!root || root === currentWs) { currentWs = root || currentWs; return }
   snapshotWsState(currentWs, { activeTabId })
   currentWs = root
   // 历史遗留：无 ws 标记的文件页签归入当前工作区
-  let assigned = false
   for (const t of tabs) {
-    if (t.kind === 'file' && !t.ws) { t.ws = root; assigned = true }
+    if (t.kind === 'file' && !t.ws) t.ws = root
   }
   const s = getWsSession(root)
   activeTabId = (s && s.activeTabId && tabs.some((t) => t.id === s.activeTabId))
     ? s.activeTabId
-    : ((tabs.find((t) => t.kind === 'files') || tabs[0] || {}).id ?? null)
-  if (assigned) { /* 已并入 persistTabs */ }
+    : null
+  if (activeTabId == null) {
+    let files = tabs.find((t) => t.kind === 'files')
+    if (!files) { files = { id: 'files', kind: 'files' }; tabs = tabs.concat(files) }
+    activeTabId = files.id
+  }
   persistTabs(); notifyTabs()
 }
 function useActiveTab() {
@@ -1244,7 +1248,10 @@ function FileTreePanel({ workspaces, sessions, sessionId }) {
   // 统一页签仓库 -> 激活文件派生：文件页签激活时预览该文件，其余页签时显示树浏览器
   const activeTab = useActiveTab()
   React.useEffect(() => {
-    const p = activeTab && activeTab.kind === 'file' ? activeTab.path : null
+    // 防御：隐藏的其他工作区文件页签不参与预览（activePath 只认当前工作区的文件页签）
+    const p = activeTab && activeTab.kind === 'file' && (!activeTab.ws || activeTab.ws === currentWs)
+      ? activeTab.path
+      : null
     if (p !== state.activePath) dispatch({ type: 'setActive', path: p })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, state.activePath])
@@ -1267,8 +1274,15 @@ function FileTreePanel({ workspaces, sessions, sessionId }) {
     if (prev) snapshotWsState(prev, { panelOpen, expanded: state.expanded, treeOn, treeW })
     const s = wsRoot ? getWsSession(wsRoot) : null
     if (s && s.panelOpen != null) {
-      if (s.panelOpen && !panelOpen) openPanelWithRoom()
-      else if (!s.panelOpen && panelOpen) closePanel()
+      // 展开态工作区：无条件确保展开（会话切换可能被原生 layout 收起，模块
+      // panelOpen 仍为 true 会误判"已展开"，故不以其为真值，幂等重调 openDetails）；
+      // 并延迟复断一次，防原生收起发生在恢复之后
+      if (s.panelOpen) {
+        openPanelWithRoom()
+        setTimeout(() => {
+          if (wsRootRef.current === wsRoot && s.panelOpen) openPanelWithRoom()
+        }, 80)
+      } else if (panelOpen) closePanel()
     }
     if (s && s.expanded) dispatch({ type: 'restoreTree', expanded: s.expanded })
     if (s && s.treeOn != null) setTreeOn(s.treeOn)
