@@ -213,6 +213,31 @@ function updateBrowser(id, fn) {
   browserById[id] = fn(browserById[id])
   persistTabs(); notifyTabs()
 }
+// 路径是否位于 root 之下（跨平台分隔符归一；root 本身也算在内）
+function underRoot(p, root) {
+  if (!p || !root) return false
+  const np = String(p).replace(/\\/g, '/')
+  const nr = String(root).replace(/\\/g, '/').replace(/\/+$/, '') || '/'
+  return np === nr || np.startsWith(nr + '/')
+}
+// 工作区切换后修剪文件页签：只保留当前工作区根下的文件（其余页签不受影响）
+function pruneFileTabs(root) {
+  if (!root) return
+  let changed = false
+  const next = tabs.filter((t) => {
+    if (t.kind !== 'file') return true
+    if (underRoot(t.path, root)) return true
+    changed = true
+    return false
+  })
+  if (!changed) return
+  tabs = next
+  if (!tabs.some((t) => t.id === activeTabId)) {
+    const files = tabs.find((t) => t.kind === 'files')
+    activeTabId = files ? files.id : (tabs[0] ? tabs[0].id : null)
+  }
+  persistTabs(); notifyTabs()
+}
 function useActiveTab() {
   hydrateTabs()
   const [, force] = React.useState()
@@ -1196,7 +1221,7 @@ function TabStrip() {
 }
 
 // ---------- 主面板（渲染在原生 details 右栏内：左预览 + 右树栏，顶部双栏） ----------
-function FileTreePanel({ workspaces, sessions }) {
+function FileTreePanel({ workspaces, sessions, sessionId }) {
   const [state, dispatch] = React.useReducer(reducer, undefined, initState)
 
   // 注册程序化打开入口：会话内点击文件引用经此在面板中预览
@@ -1234,30 +1259,32 @@ function FileTreePanel({ workspaces, sessions }) {
   //   2) workspaces 列表（最近优先 -> 首个）
   // 两个存储都是异步装载的（服务重启后面板首开时快照可能还是空的），
   // 因此先立即试一次，未就绪就订阅等数据到达后再落根。
+  const resolveDefaultRoot = () => {
+    try {
+      const ss = sessions.list.getSnapshot()
+      if (ss && ss.current !== undefined && ss.byId) {
+        const rec = ss.byId[ss.current]
+        if (rec && rec.cwd) return rec.cwd
+      }
+      const snap = workspaces.list.getSnapshot()
+      if (snap && snap.items && snap.items.length) {
+        const rec = snap.items.find((w) => w.workspaceId === snap.recentWorkspaceId)
+        const chosen = rec || snap.items[0]
+        if (chosen && chosen.path) return chosen.path
+      }
+    } catch (e) { console.error('[fsviewer] resolve default root:', e) }
+    return null
+  }
   React.useEffect(() => {
     if (!visible || state.root !== undefined) return
     let disposed = false
     const unsubs = []
     const resolve = () => {
-      let root = null
-      try {
-        const ss = sessions.list.getSnapshot()
-        if (ss && ss.current !== undefined && ss.byId) {
-          const rec = ss.byId[ss.current]
-          if (rec && rec.cwd) root = rec.cwd
-        }
-        if (!root) {
-          const snap = workspaces.list.getSnapshot()
-          if (snap && snap.items && snap.items.length) {
-            const rec = snap.items.find((w) => w.workspaceId === snap.recentWorkspaceId)
-            const chosen = rec || snap.items[0]
-            if (chosen && chosen.path) root = chosen.path
-          }
-        }
-      } catch (e) { console.error('[fsviewer] resolve default root:', e) }
+      const root = resolveDefaultRoot()
       if (disposed) return true
       if (root !== null) {
         dispatch({ type: 'setRoot', root })
+        setWsRoot(root)
         return true
       }
       return false
@@ -1273,6 +1300,28 @@ function FileTreePanel({ workspaces, sessions }) {
     return () => { disposed = true; unsubs.forEach((u) => u()) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible])
+
+  // 工作区根（区别于树当前浏览目录 state.root——目录引用点击只导航不换工作区）：
+  // 文件页签只保留该根下的文件，切换工作区后旧文件页签自动清除
+  const [wsRoot, setWsRoot] = React.useState(null)
+  React.useEffect(() => {
+    if (wsRoot) pruneFileTabs(wsRoot)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wsRoot])
+
+  // 会话/工作区切换：重解析根目录（会话 cwd 优先），树与文件页签跟随当前工作区
+  const lastSession = React.useRef(null)
+  React.useEffect(() => {
+    if (lastSession.current === null) { lastSession.current = sessionId; return }
+    if (lastSession.current === sessionId) return
+    lastSession.current = sessionId
+    const root = resolveDefaultRoot()
+    if (root) {
+      dispatch({ type: 'gotoRoot', root })
+      setWsRoot(root)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId])
 
   // 每次面板可见自动刷新根目录层：会话中新产生的文件立即可见
   React.useEffect(() => {
@@ -1808,10 +1857,10 @@ export function apply(ctx) {
   ctx.slots.inject('details', () =>
     ctx.slots.register(
       { name: 'details', id: 'fsviewer-panel', priority: -10 },
-      () => React.createElement(
+      (props) => React.createElement(
         PanelErrorBoundary,
         null,
-        React.createElement(FileTreePanel, { workspaces: ctx.workspaces, sessions: ctx.sessions })
+        React.createElement(FileTreePanel, { workspaces: ctx.workspaces, sessions: ctx.sessions, sessionId: props.sessionId })
       )
     )
   )

@@ -48,7 +48,7 @@ const stubCtx = {
     inject: (slotName, register) => {
       registrations.push(register())
     },
-    register: (meta, compFactory) => ({ meta, comp: compFactory() }),
+    register: (meta, compFactory) => ({ meta, comp: compFactory({ sessionId: 'sess-smoke' }) }),
   },
   workspaces: {},
   // ui-layout 布局服务桩：记录 open/close 调用，验证停靠联动被正确触发
