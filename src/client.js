@@ -148,6 +148,29 @@ function openFileTab(path) {
   activeTabId = t.id
   persistTabs(); notifyTabs()
 }
+// html 文件：打开/聚焦对应的内置浏览器页签（按路径去重），经 /fsviewer-api/f 同源渲染。
+// internal 页签内容经本源服务，走严格沙箱（同代理模式）。
+function openHtmlInBrowser(path) {
+  openPanelWithRoom()
+  const norm = String(path || '').replace(/\\/g, '/')
+  let tab = tabs.find((t) => t.kind === 'browser' && browserById[t.id] && browserById[t.id].htmlPath === norm)
+  if (!tab) {
+    const id = mkId('b')
+    browserById[id] = {
+      title: baseName(norm),
+      url: '/fsviewer-api/f' + norm,
+      input: norm,
+      proxy: false,
+      hist: [], idx: -1, reload: 0,
+      htmlPath: norm,
+      internal: true
+    }
+    tab = { id, kind: 'browser' }
+    tabs = tabs.concat(tab)
+  }
+  activeTabId = tab.id
+  persistTabs(); notifyTabs()
+}
 // 「打开文件」页签下双击文件：该页签原地替换为文件页签（不新增页签，Codex 首开语义）。
 // 若该文件已有独立页签，则移除 files 页签并聚焦已有页签。
 function replaceFilesTabWithFile(path) {
@@ -423,6 +446,8 @@ function openPanelWithRoom() {
   startPanelResizeWatch()
 }
 function openFileInPanel(path) {
+  // html 系列文件改道内置浏览器渲染
+  if (isHtmlFile(baseName(path))) return openHtmlInBrowser(path)
   openPanelWithRoom()
   openFileTab(path)
 }
@@ -663,6 +688,8 @@ function fileBadge(name) {
   return { text: ext.slice(0, 3).toUpperCase(), color: '#8b949e' }
 }
 const isMdFile = (name) => /\.(md|markdown)$/i.test(name || '')
+// html 系列文件：不用文本预览，改用内置浏览器页签渲染
+const isHtmlFile = (name) => /\.(html?|xhtml)$/i.test(name || '')
 
 // ---------- 顶部切换按钮图标：右侧栏 ----------
 // 与原生 IconPanelLeftOutline16 完全同源（同一份 16x16 实心路径），仅水平镜像
@@ -1021,11 +1048,15 @@ function TreeColumn({ workspaces, state, dispatch, width, onResizeStart, tabKind
   function renderRows(entries, depth) {
     return filterEntries(entries).map((entry) => {
       if (entry.type !== 'directory') {
+        const html = isHtmlFile(entry.name)
         return (
           <FileRow key={entry.path} entry={entry} depth={depth} tabKind={tabKind}
-            active={entry.path === state.activePath}
-            onActivate={() => openFileTab(entry.path)}
-            onOpen={() => (tabKind === 'files' ? replaceFilesTabWithFile(entry.path) : openFileTab(entry.path))} />
+            active={!html && entry.path === state.activePath}
+            onActivate={() => (html ? openHtmlInBrowser(entry.path) : openFileTab(entry.path))}
+            onOpen={() => {
+              if (html) return openHtmlInBrowser(entry.path)
+              return tabKind === 'files' ? replaceFilesTabWithFile(entry.path) : openFileTab(entry.path)
+            }} />
         )
       }
       const isExpanded = !!state.expanded[entry.path]
@@ -1457,14 +1488,24 @@ function BrowserPane({ tabId }) {
         <button type="button" onClick={() => patch((t) => ({ ...t, reload: t.reload + 1 }))} data-tip="重新加载" aria-label="重新加载"
           className="fsviewer-iconbtn fsviewer-tip"><IconReload /></button>
         <input type="text" placeholder="输入网址或搜索词，回车打开" value={active.input} spellCheck={false}
+          readOnly={!!active.internal}
+          title={active.internal ? '本地文件预览（' + active.url + '）' : undefined}
           onChange={(e) => patch((t) => ({ ...t, input: e.target.value }))}
           onKeyDown={(e) => { if (e.key === 'Enter') navigate(e.currentTarget.value) }}
-          style={{ flex: '1 1 auto', minWidth: 0, boxSizing: 'border-box', padding: '5px 8px', backgroundColor: V.input, border: '1px solid ' + V.line, borderRadius: 6, color: V.fg, fontSize: 12 }} />
-        <button type="button" onClick={() => patch((t) => ({ ...t, proxy: !t.proxy, reload: t.reload + 1 }))}
-          data-tip={active.proxy ? '代理模式：经主机同源回源（绕过 X-Frame-Options）' : '直连模式：部分站点会拒绝被嵌入，可切代理'}
-          aria-label="切换代理模式"
-          className={active.proxy ? 'fsviewer-chat-quote on' : 'fsviewer-chat-quote'}>{active.proxy ? '代理' : '直连'}</button>
-        <button type="button" onClick={() => { if (active.url) window.open(active.url, '_blank', 'noopener') }}
+          style={{ flex: '1 1 auto', minWidth: 0, boxSizing: 'border-box', padding: '5px 8px', backgroundColor: V.input, border: '1px solid ' + V.line, borderRadius: 6, color: active.internal ? V.muted : V.fg, fontSize: 12 }} />
+        {!active.internal
+          ? (
+            <button type="button" onClick={() => patch((t) => ({ ...t, proxy: !t.proxy, reload: t.reload + 1 }))}
+              data-tip={active.proxy ? '代理模式：经主机同源回源（绕过 X-Frame-Options）' : '直连模式：部分站点会拒绝被嵌入，可切代理'}
+              aria-label="切换代理模式"
+              className={active.proxy ? 'fsviewer-chat-quote on' : 'fsviewer-chat-quote'}>{active.proxy ? '代理' : '直连'}</button>
+          )
+          : null}
+        <button type="button" onClick={() => {
+          if (!active.url) return
+          const abs = active.url.startsWith('/') ? window.location.origin + active.url : active.url
+          window.open(abs, '_blank', 'noopener')
+        }}
           disabled={!active.url} data-tip="在新窗口打开" aria-label="在新窗口打开"
           className="fsviewer-iconbtn fsviewer-tip" style={{ opacity: active.url ? 1 : 0.4 }}><IconExternal /></button>
       </div>
@@ -1477,12 +1518,15 @@ function BrowserPane({ tabId }) {
         {tabs.filter((t) => t.kind === 'browser').map((t) => {
           const b = browserById[t.id]
           if (!b) return null
+          // internal（本地 html）/代理页签的内容都经本源服务，走严格沙箱；
+          // 直连为跨源内容，放行 allow-same-origin 让页面用自己的 storage
+          const sandboxed = b.proxy || b.internal
           return (
             <iframe
               key={t.id + '#' + b.reload}
-              src={b.url ? (b.proxy ? '/fsviewer-api/p/' + b.url : b.url) : 'about:blank'}
+              src={b.url ? ((b.proxy && !b.internal) ? '/fsviewer-api/p/' + b.url : b.url) : 'about:blank'}
               title={b.title}
-              sandbox={b.proxy
+              sandbox={sandboxed
                 ? 'allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox'
                 : 'allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-same-origin'}
               style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', border: 'none',

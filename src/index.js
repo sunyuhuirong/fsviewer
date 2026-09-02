@@ -7,6 +7,8 @@
  *   - GET /fsviewer-api/file?path=<绝对路径>   读文本文件（1MB 上限，严格 UTF-8 检测二进制）
  *   - POST /fsviewer-api/chat                  侧边聊天：直连 ctx.llm 流式调用（SSE 下发），
  *                                              模型缺省取 ctx.agentDefaultModel 默认设置
+ *   - GET /fsviewer-api/models                聊天模型目录（providers + 默认模型）
+ *   - GET /fsviewer-api/f/<绝对路径>          静态文件服务：浏览器视图渲染本地 html 及其资源
  *   - GET /fsviewer-api/p/<目标URL>            浏览器视图同源代理：绕过 X-Frame-Options，
  *                                              注入 <base> + 尽力改写链接，让页面经代理回源
  *
@@ -43,6 +45,70 @@ const CHAT_SYSTEM_PROMPT =
 // ---------- 同源代理 ----------
 const PROXY_PREFIX = '/fsviewer-api/p/'
 const MAX_PROXY_BYTES = 8 * 1024 * 1024
+
+// ---------- 静态文件服务（内置浏览器渲染本地 html 及其资源） ----------
+// 路径结构化：/fsviewer-api/f/<绝对路径>，页面内相对引用（./style.css）会自然解析回
+// 同前缀路由，本地 css/js/图片随之加载。跨平台：POSIX 补前导 '/'，Windows 盘符路径
+// （C:/...，反斜杠统一转 '/'）。信任级别同 list/file 路由：本机个人工具、无鉴权。
+const RAW_PREFIX = '/fsviewer-api/f/'
+const MAX_RAW_BYTES = 30 * 1024 * 1024
+const RAW_MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.htm': 'text/html; charset=utf-8',
+  '.xhtml': 'application/xhtml+xml; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.avif': 'image/avif',
+  '.ico': 'image/x-icon',
+  '.bmp': 'image/bmp',
+  '.txt': 'text/plain; charset=utf-8',
+  '.md': 'text/markdown; charset=utf-8',
+  '.xml': 'application/xml; charset=utf-8',
+  '.pdf': 'application/pdf',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.otf': 'font/otf',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm'
+}
+function mimeFor(name) {
+  const dot = name.lastIndexOf('.')
+  return dot > 0 ? (RAW_MIME[name.slice(dot).toLowerCase()] || 'application/octet-stream') : 'application/octet-stream'
+}
+async function handleRawFile(url, res) {
+  let target = url.pathname.startsWith(RAW_PREFIX) ? url.pathname.slice(RAW_PREFIX.length) : ''
+  try { target = decodeURIComponent(target) } catch { /* 保留原样 */ }
+  target = target.replace(/\\/g, '/')
+  // POSIX 补前导 '/'；Windows 盘符路径（C:/...）isAbsolute 已认可
+  if (!isAbsolute(target)) target = '/' + target
+  target = resolvePath(target)
+  const info = await stat(target).catch((e) => {
+    throw httpError(e.code === 'ENOENT' ? 404 : 500, `无法读取文件 ${target}: ${e.message}`)
+  })
+  if (info.isDirectory()) throw httpError(400, `${target} 是目录`)
+  if (info.size > MAX_RAW_BYTES) throw httpError(413, `文件超过 ${Math.floor(MAX_RAW_BYTES / 1024 / 1024)}MB 上限`)
+  const buf = await readFile(target).catch((e) => {
+    throw httpError(500, `无法读取 ${target}: ${e.message}`)
+  })
+  res.writeHead(200, {
+    'content-type': mimeFor(target),
+    'cache-control': 'no-store',
+    'content-length': buf.length
+  })
+  res.end(buf)
+}
 
 function json(res, status, payload) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
@@ -404,15 +470,16 @@ export function apply(ctx) {
           if (path === '/fsviewer-api/list') return await handleList(url, res)
           if (path === '/fsviewer-api/file') return await handleFile(url, res)
           if (path === '/fsviewer-api/models') return await handleModels(ctx, res)
+          if (path.startsWith(RAW_PREFIX)) return await handleRawFile(url, res)
           if (path.startsWith(PROXY_PREFIX)) return await handleProxy(url, req, res)
         } else if (req.method === 'POST' && path === '/fsviewer-api/chat') {
           return await handleChat(ctx, req, res)
         }
-        return json(res, 405, { error: '不支持的请求：可用 GET /fsviewer-api/list、/file、/models、/p/<URL> 与 POST /fsviewer-api/chat' })
+        return json(res, 405, { error: '不支持的请求：可用 GET /fsviewer-api/list、/file、/models、/f/<路径>、/p/<URL> 与 POST /fsviewer-api/chat' })
       } catch (e) {
         return json(res, e && e.httpStatus ? e.httpStatus : 500, { error: e && e.message ? e.message : String(e) })
       }
     }
   }), 'fsviewer: /fsviewer-api routes')
-  console.log('[fsviewer] Host routes ready: GET /fsviewer-api/{list,file,models,p/*}, POST /fsviewer-api/chat')
+  console.log('[fsviewer] Host routes ready: GET /fsviewer-api/{list,file,models,f/*,p/*}, POST /fsviewer-api/chat')
 }
