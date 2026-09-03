@@ -24,7 +24,12 @@
  * 数据来源：
  *   - 目录/文件：GET /fsviewer-api/list、/file；聊天：POST /fsviewer-api/chat（SSE）
  *   - 浏览器代理：GET /fsviewer-api/p/<URL>
- *   - workspaces.list 仅用于解析默认根目录；选择目录 / 系统打开继续用 workspaces
+ *   - workspaces.list + sessions.list 用于判定「当前工作区」（会话所属的 workspace）；
+ *     系统打开继续用 workspaces
+ *
+ * 工作区隔离：面板会话按 workspaceId 存于 panels（localStorage tabs.v4），文件视图
+ * 再以 key={wsKey} 挂载——切工作区即换实例，页签 / 文件树 / 浏览器 / 聊天 / 面板开合
+ * 全部随工作区走。
  *
  * 插件契约：exports.inject = ["slots", "workspaces", "sessions", "layout"]。
  */
@@ -40,20 +45,19 @@ const panelListeners = new Set()
 let layoutApi = null
 // 原生系统打开（包装 workspaces.openPath 前保存，面板内 ⧉ 仍走系统打开）
 let nativeOpenPath = null
-// FileTreePanel 挂载时注册的程序化打开文件入口
-let panelFileDispatch = null
 // FileTreePanel 挂载时注册的程序化「树根跳转」入口（目录引用点击 → 面板树定位）
 let panelDirDispatch = null
+// 面板未挂载（右栏收起）时暂存目录跳转目标，FilesView 挂载后消费；兜底交还系统打开
+let pendingDirJump = null
 
-// ---------- 按工作区独立的侧边栏面板（彻底割裂） ----------
+// ---------- 按工作区独立的侧边栏面板 ----------
 // 每个工作区一个完整面板会话：页签（files 打开文件浏览器 / file 文件 / chat 侧边聊天
 // / browser 浏览器）、激活页签、浏览器状态、聊天会话、面板开合、树展开与树栏状态。
 // 切换工作区 = 整体切换面板会话：各工作区只能看到各自的页签与内容，切回原样恢复。
-// 允许全部关闭：空页签时面板显示三类创建入口；页签 × 只显示在激活页签上；
-// 「+」弹出菜单可新建三类页签。
-const TABS_KEY = 'fsviewer/tabs.v3'
+// 面板键取原生 workspaceId（目录改名/移动不丢面板），路径另存 panel.path。
+const TABS_KEY = 'fsviewer/tabs.v4'
 let currentWs = null
-let panels = {}        // wsRoot -> 面板会话
+let panels = {}        // wsKey -> 面板会话
 let seq = { f: 0, c: 0, b: 0 }
 let panelsHydrated = false
 const tabsListeners = new Set()
@@ -63,44 +67,51 @@ let workspacesSvc = null
 function subscribeTabs(fn) { tabsListeners.add(fn); return () => tabsListeners.delete(fn) }
 function notifyTabs() { tabsListeners.forEach((l) => l()) }
 function mkId(kind) { return kind + (++seq[kind]) }
-function wsDisplayName(root) {
-  const segs = String(root || '').split(/[\\/]+/).filter(Boolean)
-  return segs.length ? segs[segs.length - 1] : ''
-}
-/** 解析当前默认工作区根：workspaces 最近使用项优先（用户"当前工作区"的权威信号），
- *  回落当前会话 cwd */
-function resolveDefaultRoot(sessionId) {
+/**
+ * 解析当前工作区：当前会话所属的 workspace（原生 sessionIds 成员判定，与侧边栏
+ * 分组同源）> 最近使用的 workspace > 会话 cwd。返回 { key, path } 或 null。
+ */
+function resolveCurrentWs(sessionId) {
   try {
-    // 会话 cwd 优先（跟随会话切换，sessions.current 滞后时由 sessionId 兜底）
     const ss = sessionsSvc && sessionsSvc.list && sessionsSvc.list.getSnapshot()
-    if (ss && ss.byId) {
-      const sid = (sessionId && ss.byId[sessionId]) ? sessionId : ss.current
-      if (sid !== undefined && ss.byId[sid] && ss.byId[sid].cwd) return ss.byId[sid].cwd
-    }
-    // 回落：workspaces 最近使用项
+    const sid = (sessionId && ss && ss.byId && ss.byId[sessionId]) ? sessionId : (ss && ss.current)
+    const cwd = (sid && ss.byId && ss.byId[sid] && ss.byId[sid].cwd) || null
     const snap = workspacesSvc && workspacesSvc.list && workspacesSvc.list.getSnapshot()
-    if (snap && snap.items && snap.items.length) {
-      const rec = snap.items.find((w) => w.workspaceId === snap.recentWorkspaceId)
-      const chosen = rec || snap.items[0]
-      if (chosen && chosen.path) return chosen.path
-    }
-  } catch (e) { console.error('[fsviewer] resolve default root:', e) }
+    const items = (snap && snap.items) || []
+    const hit = (sid && items.find((w) => w.sessionIds.includes(sid))) ||
+      items.find((w) => w.workspaceId === snap.recentWorkspaceId) ||
+      (cwd ? items.find((w) => w.path === cwd) : null)
+    if (hit) return { key: hit.workspaceId, path: hit.path }
+    if (cwd) return { key: 'cwd:' + cwd, path: cwd }
+  } catch (e) { console.error('[fsviewer] resolve workspace:', e) }
   return null
 }
-/** 打开文件前确保已归属工作区（无法解析时使用 @default 兜底面板） */
-function ensureCurrentWs() {
-  if (!currentWs) {
-    setWorkspace(resolveDefaultRoot() || '@default')
-  }
+/** 确保面板存在并记下目录路径（幂等，不广播——首帧同步定位用） */
+function ensurePanel(key, path) {
+  hydratePanels()
+  let p = panels[key]
+  if (!p) p = panels[key] = newPanel(path)
+  else if (path && p.path !== path) p.path = path
+  return p
 }
-/** 当前工作区的面板会话（无工作区信息时为 null） */
+/** 打开文件前确保已归属工作区（无法解析时用 @default 兜底面板） */
+function ensureCurrentWs() {
+  if (currentWs) return currentWs
+  const ws = resolveCurrentWs()
+  currentWs = ws ? ws.key : '@default'
+  ensurePanel(currentWs, ws ? ws.path : null)
+  return currentWs
+}
+/** 当前工作区的面板会话（首次调用兜底创建） */
 function P() {
   hydratePanels()
-  return panels[currentWs] || null
+  if (!currentWs) currentWs = '@default'
+  return panels[currentWs] || (panels[currentWs] = newPanel(null))
 }
-function newPanel() {
+function newPanel(path) {
   const c = mkId('c')
   return {
+    path: path || null,
     tabs: [{ id: 'files', kind: 'files' }, { id: c, kind: 'chat' }],
     activeTabId: 'files',
     browser: {},
@@ -117,6 +128,7 @@ function persistPanels() {
     const out = {}
     for (const [ws, p] of Object.entries(panels)) {
       out[ws] = {
+        path: p.path || null,
         activeTabId: p.activeTabId,
         panelOpen: p.panelOpen,
         expanded: p.expanded || {},
@@ -142,80 +154,42 @@ function hydratePanels() {
   panelsHydrated = true
   let d = null
   try { d = JSON.parse(localStorage.getItem(TABS_KEY) || 'null') } catch { /* 损坏按默认 */ }
-  if (d && d.panels && Object.keys(d.panels).length) {
-    // v3 面板结构
-    for (const [ws, sp] of Object.entries(d.panels)) {
-      const p = newPanel()
-      p.tabs = (Array.isArray(sp.tabs) ? sp.tabs : []).filter((t) => t && t.id && t.kind)
-      p.activeTabId = sp.activeTabId || null
-      p.panelOpen = sp.panelOpen != null ? !!sp.panelOpen : null
-      p.expanded = (sp.expanded && typeof sp.expanded === 'object') ? sp.expanded : {}
-      p.treeOn = sp.treeOn !== false
-      p.treeW = typeof sp.treeW === 'number' ? sp.treeW : TREE_DEFAULT_WIDTH
-      for (const [id, b] of Object.entries(sp.browser || {})) {
-        p.browser[id] = { title: '新标签页', url: null, input: '', proxy: false, hist: [], idx: -1, reload: 0, ...b }
-      }
-      for (const [id, c] of Object.entries(sp.chats || {})) {
-        p.chats[id] = {
-          route: (c && c.route) || null,
-          model: (c && c.model && c.model.provider && c.model.model) ? { provider: c.model.provider, model: c.model.model } : null,
-          messages: (c && Array.isArray(c.messages) ? c.messages : [])
-            .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.length)
-            .slice(-60)
-        }
-      }
-      p.tabs = p.tabs.filter((t) => t.kind !== 'browser' || p.browser[t.id])
-      p.tabs = p.tabs.filter((t) => t.kind !== 'chat' || p.chats[t.id])
-      if (!p.tabs.some((t) => t.id === p.activeTabId)) {
-        p.activeTabId = p.tabs.length ? p.tabs[p.tabs.length - 1].id : null
-      }
-      for (const t of p.tabs) {
-        const n = Number(String(t.id).slice(1)) || 0
-        if (t.kind === 'file') seq.f = Math.max(seq.f, n)
-        else if (t.kind === 'chat') seq.c = Math.max(seq.c, n)
-        else if (t.kind === 'browser') seq.b = Math.max(seq.b, n)
-      }
-      panels[ws] = p
+  const stored = ((d && d.panels) && typeof d.panels === 'object') ? d.panels : {}
+  for (const [key, sp] of Object.entries(stored)) {
+    const p = newPanel(sp.path || null)
+    p.tabs = (Array.isArray(sp.tabs) ? sp.tabs : []).filter((t) => t && t.id && t.kind)
+    p.activeTabId = sp.activeTabId || null
+    p.panelOpen = sp.panelOpen != null ? !!sp.panelOpen : null
+    p.expanded = (sp.expanded && typeof sp.expanded === 'object') ? sp.expanded : {}
+    p.treeOn = sp.treeOn !== false
+    p.treeW = typeof sp.treeW === 'number' ? sp.treeW : TREE_DEFAULT_WIDTH
+    for (const [id, b] of Object.entries(sp.browser || {})) {
+      p.browser[id] = { title: '新标签页', url: null, input: '', proxy: false, hist: [], idx: -1, reload: 0, ...b }
     }
-    currentWs = (d.currentWs && panels[d.currentWs]) ? d.currentWs : (Object.keys(panels)[0] || null)
-    return
+    for (const [id, c] of Object.entries(sp.chats || {})) {
+      p.chats[id] = {
+        route: (c && c.route) || null,
+        model: (c && c.model && c.model.provider && c.model.model) ? { provider: c.model.provider, model: c.model.model } : null,
+        messages: (c && Array.isArray(c.messages) ? c.messages : [])
+          .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.length)
+          .slice(-60)
+      }
+    }
+    p.tabs = p.tabs.filter((t) => t.kind !== 'browser' || p.browser[t.id])
+    p.tabs = p.tabs.filter((t) => t.kind !== 'chat' || p.chats[t.id])
+    if (!p.tabs.some((t) => t.id === p.activeTabId)) {
+      p.activeTabId = p.tabs.length ? p.tabs[p.tabs.length - 1].id : null
+    }
+    for (const t of p.tabs) {
+      const n = Number(String(t.id).slice(1)) || 0
+      if (t.kind === 'file') seq.f = Math.max(seq.f, n)
+      else if (t.kind === 'chat') seq.c = Math.max(seq.c, n)
+      else if (t.kind === 'browser') seq.b = Math.max(seq.b, n)
+    }
+    panels[key] = p
   }
-  if (d && (Array.isArray(d.tabs) || d.chats || d.browser)) {
-    // v2 扁平结构迁移：文件页签按 ws 分组；聊天/浏览器页签归入存储的当前工作区
-    const baseWs = (typeof d.currentWs === 'string' && d.currentWs) || '@default'
-    for (const t of d.tabs || []) {
-      if (!t || !t.id || !t.kind || t.kind === 'files') continue
-      const ws = (t.kind === 'file' && t.ws) ? t.ws : baseWs
-      const p = panels[ws] || (panels[ws] = newPanel())
-      if (t.kind === 'file') {
-        p.tabs = p.tabs.concat({ id: t.id, kind: 'file', path: t.path })
-        seq.f = Math.max(seq.f, Number(String(t.id).slice(1)) || 0)
-      } else if (t.kind === 'chat') {
-        p.tabs = p.tabs.concat({ id: t.id, kind: 'chat' })
-        const c = (d.chats && d.chats[t.id]) || {}
-        p.chats[t.id] = {
-          route: c.route || null,
-          model: (c.model && c.model.provider && c.model.model) ? { provider: c.model.provider, model: c.model.model } : null,
-          messages: (c.messages || []).filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.length).slice(-60)
-        }
-        seq.c = Math.max(seq.c, Number(String(t.id).slice(1)) || 0)
-      } else if (t.kind === 'browser') {
-        p.tabs = p.tabs.concat({ id: t.id, kind: 'browser' })
-        const b = (d.browser && d.browser[t.id]) || {}
-        p.browser[t.id] = { title: '新标签页', url: null, input: '', proxy: false, hist: [], idx: -1, reload: 0, ...b }
-        seq.b = Math.max(seq.b, Number(String(t.id).slice(1)) || 0)
-      }
-    }
-    currentWs = panels[baseWs] ? baseWs : (Object.keys(panels)[0] || null)
-    if (currentWs) {
-      const p = panels[currentWs]
-      p.activeTabId = (d.activeTabId && p.tabs.some((t) => t.id === d.activeTabId)) ? d.activeTabId : (p.tabs.length ? p.tabs[p.tabs.length - 1].id : null)
-    }
-    if (Object.keys(panels).length) return
-  }
-  // 全新环境：默认面板（打开文件 + 侧边聊天）
-  currentWs = '@default'
-  panels[currentWs] = newPanel()
+  // 存储里的 currentWs 只是上次退出时的落点；真实当前工作区由挂载后的订阅解析
+  currentWs = (d && d.currentWs && panels[d.currentWs]) ? d.currentWs : null
 }
 function getActiveTab() {
   const p = P()
@@ -333,21 +307,20 @@ function updateBrowser(id, fn) {
   p.browser[id] = fn(p.browser[id])
   persistPanels(); notifyTabs()
 }
-/** 切换工作区：整体切换面板会话；快照旧面板的面板开合并恢复新面板的开合与树状态 */
-function setWorkspace(root) {
-  hydratePanels()
-  if (!root || root === currentWs) { currentWs = root || currentWs; return }
+/** 切换工作区：整体切换面板会话；快照旧面板的开合，恢复新面板记住的开合 */
+function setWorkspace(key, path) {
+  if (!key) return
+  if (key === currentWs) { ensurePanel(key, path); persistPanels(); return }
   const prev = currentWs
-  if (prev && panels[prev]) panels[prev].panelOpen = panelOpen   // 面板开合快照（树状态由面板持续回写）
-  currentWs = root
-  if (!panels[root]) panels[root] = newPanel()
+  if (prev && panels[prev]) panels[prev].panelOpen = panelOpen   // 开合快照（树状态由 FilesView 持续回写）
+  currentWs = key
+  const p = ensurePanel(key, path)
   persistPanels(); notifyTabs()
   // 恢复面板开合：展开态工作区无条件确保展开（幂等 + 延迟复断，防原生收起晚于恢复），收起态则收起
-  const p = panels[root]
   if (p.panelOpen != null) {
     if (p.panelOpen) {
       openPanelWithRoom()
-      setTimeout(() => { if (currentWs === root && p.panelOpen) openPanelWithRoom() }, 80)
+      setTimeout(() => { if (currentWs === key && p.panelOpen) openPanelWithRoom() }, 80)
     } else if (panelOpen) closePanel()
   }
 }
@@ -414,22 +387,20 @@ async function sendChat(chatId, text, fileCtx) {
     const more = fileCtx.content.length > CHAT_QUOTE_CHARS ? '\n…（已截断）' : ''
     content += '\n\n---\n[引用文件: ' + fileCtx.path + (fileCtx.truncated ? '，前 1MB' : '') + ']\n```\n' + clip + more + '\n```'
   }
-  updateChat(chatId, (cur) => {
-    cur.messages = cur.messages.concat([
-      { role: 'user', content },
-      { role: 'assistant', content: '', streaming: true }
-    ])
-    cur.streaming = true
-    return cur
-  })
+  // 直接操作捕获的聊天对象引用（JS 引用语义保证写入正确面板，不受 P() 切换影响）
+  c.messages = c.messages.concat([
+    { role: 'user', content },
+    { role: 'assistant', content: '', streaming: true }
+  ])
+  c.streaming = true
+  persistPanels(); notifyTabs()
   const ctrl = new AbortController()
   chatAbort[chatId] = ctrl
   try {
-    const cur = getChat(chatId)
-    const body = { messages: cur.messages.slice(0, -1).map((m) => ({ role: m.role, content: m.content })) }
-    if (cur.model && cur.model.provider && cur.model.model) {
-      body.provider = cur.model.provider
-      body.model = cur.model.model
+    const body = { messages: c.messages.slice(0, -1).map((m) => ({ role: m.role, content: m.content })) }
+    if (c.model && c.model.provider && c.model.model) {
+      body.provider = c.model.provider
+      body.model = c.model.model
     }
     const res = await fetch('/fsviewer-api/chat', {
       method: 'POST',
@@ -457,34 +428,28 @@ async function sendChat(chatId, text, fileCtx) {
         if (!dataLine) continue
         let evt
         try { evt = JSON.parse(dataLine.slice(5).trim()) } catch { continue }
-        updateChat(chatId, (cur) => {
-          const m = lastAssistant(cur)
-          if (evt.meta && evt.meta.provider) cur.route = evt.meta
-          else if (evt.delta && m) {
-            if (typeof evt.delta.text === 'string') m.content += evt.delta.text
-            else if (typeof evt.delta.reasoning === 'string') m.reasoning = (m.reasoning || '') + evt.delta.reasoning
-          } else if (evt.error && m) m.error = evt.error
-          else if (evt.done && evt.done.finish === 'max-tokens' && m) m.note = '回复达到 token 上限，可能被截断'
-          return cur
-        })
+        // 直接操作捕获的聊天对象（引用语义不受工作区切换影响）
+        const m = lastAssistant(c)
+        if (evt.meta && evt.meta.provider) c.route = evt.meta
+        else if (evt.delta && m) {
+          if (typeof evt.delta.text === 'string') m.content += evt.delta.text
+          else if (typeof evt.delta.reasoning === 'string') m.reasoning = (m.reasoning || '') + evt.delta.reasoning
+        } else if (evt.error && m) m.error = evt.error
+        else if (evt.done && evt.done.finish === 'max-tokens' && m) m.note = '回复达到 token 上限，可能被截断'
+        persistPanels(); notifyTabs()
       }
     }
   } catch (e) {
     if (!ctrl.signal.aborted) {
-      updateChat(chatId, (cur) => {
-        const m = lastAssistant(cur)
-        if (m) m.error = humanError(e)
-        return cur
-      })
+      const m = lastAssistant(c)
+      if (m) m.error = humanError(e)
     }
   } finally {
-    updateChat(chatId, (cur) => {
-      const m = lastAssistant(cur)
-      if (m) delete m.streaming
-      cur.streaming = false
-      return cur
-    })
+    const m = lastAssistant(c)
+    if (m) delete m.streaming
+    c.streaming = false
     delete chatAbort[chatId]
+    persistPanels(); notifyTabs()
   }
 }
 function stopChat(chatId) { if (chatAbort[chatId]) chatAbort[chatId].abort() }
@@ -540,8 +505,13 @@ function ensureRoomForDetails() {
 // 弹性轨道、自然吸收挤压；窗口变大到原生放得下（≥300）后自动解除覆盖。
 let pinMode = null          // null | 'wide'（⤢ 用户选择，不自动解除）| 'squeeze'（小窗口挤压，自动解除）
 let panelResizeWatch = null
+let panelGuardWatch = null   // 面板开启期间的守护轮询（防外部收起）
+function stopPanelGuardWatch() {
+  if (panelGuardWatch) { clearInterval(panelGuardWatch); panelGuardWatch = null }
+}
 function stopPanelResizeWatch() {
   if (panelResizeWatch) { window.removeEventListener('resize', panelResizeWatch); panelResizeWatch = null }
+  stopPanelGuardWatch()
 }
 // 面板打开期间常驻：窗口尺寸变化时双向调度——原生被饿（<300 或 0）就钉挤压宽度，
 // 原生放得下就解除覆盖交还（⤢ 的 520 是用户选择，不动）。
@@ -549,6 +519,10 @@ function startPanelResizeWatch() {
   stopPanelResizeWatch()
   panelResizeWatch = () => {
     if (!panelOpen || pinMode === 'wide') return
+    // 守护：面板应展开却被外部收起（如会话/工作区切换时原生延迟收起 details）→ 重新展开
+    const col = document.querySelector('[class*="detailsCol"]')
+    const w = col ? col.getBoundingClientRect().width : 0
+    if (w < 80) { layoutApi && layoutApi.openDetails(); return }
     const nativeFits = window.innerWidth - sidebarRenderedWidth() - CENTER_MIN_PX >= DETAILS_MIN_PX
     if (pinMode === 'squeeze') {
       if (nativeFits) tryReleaseSqueeze()
@@ -558,6 +532,9 @@ function startPanelResizeWatch() {
     }
   }
   window.addEventListener('resize', panelResizeWatch)
+  // resize 事件覆盖不到"无 resize 的外部收起"：面板开启期间低频轮询守护
+  stopPanelGuardWatch()
+  panelGuardWatch = setInterval(panelResizeWatch, 250)
 }
 // 试探-回退式解除：resize 瞬间 sidebar 内联可能还是旧值（如 narrow 退出前仍是 56 图标栏），
 // 误判「原生放得下」就解除会让原生把 details 关成 0（details 契约是 ≥300 或 0，无中间态），
@@ -605,8 +582,16 @@ function openFileInPanel(path) {
 function openDirInPanel(path) {
   openPanelWithRoom()
   ensureFilesTab()
-  if (panelDirDispatch) panelDirDispatch(path)
-  else if (nativeOpenPath) nativeOpenPath(path)
+  if (panelDirDispatch) return panelDirDispatch(path)
+  // 右栏收起时 FilesView 尚未挂载、panelDirDispatch 为空：暂存目标，挂载后消费
+  pendingDirJump = path
+  // 兜底：极小窗口原生右栏可能打不开 → 交还系统打开
+  setTimeout(() => {
+    if (!panelDirDispatch && pendingDirJump === path) {
+      pendingDirJump = null
+      if (nativeOpenPath) nativeOpenPath(path)
+    }
+  }, 400)
 }
 function subscribePanel(fn) { panelListeners.add(fn); return () => panelListeners.delete(fn) }
 function setPanelOpen(next) {
@@ -728,7 +713,6 @@ function injectToggleStyle() {
 // 面板渲染在原生 details 右栏内（宽度由原生列决定，用户可拖拽 300-520px）；
 // 树栏默认 150px，左缘可拖拽调宽（120-320px）
 const TREE_DEFAULT_WIDTH = 150
-let treeWidth = TREE_DEFAULT_WIDTH
 const Z_TRIGGER = 301
 // ⤢ 展开：覆盖 AppFrame 网格列宽（!important 压过内联样式）；
 // 极小窗口挤压展开复用同一机制，只是钉的宽度不同。
@@ -880,16 +864,17 @@ function FsToggleButton() {
 
 // ---------- 文件树 + 预览状态 ----------
 // 布局为 Codex 式左右分栏：左侧预览（无激活文件时空状态），右侧目录树常显。
-function initState() {
+// 每个工作区一份（FilesView key={wsKey} 挂载），初值取该工作区面板记住的树状态。
+function initState(panel) {
   return {
-    root: undefined,      // undefined=尚未解析；null=无 workspace；string=绝对路径
+    root: (panel && panel.path) || null,   // 工作区目录；null=尚未解析出工作区
     nonce: 0,             // 强制重载（刷新）
     crumbs: [],
     entries: [],
     truncated: false,
     loading: false,
     error: null,
-    expanded: {},         // path -> true（已展开）
+    expanded: (panel && panel.expanded) || {},   // path -> true（已展开）
     branches: {},         // path -> { status:'new'|'ok'|'err', entries, truncated, error }
     term: '',
     activePath: null,     // 当前预览文件（null = 空状态）——由统一页签仓库派生同步
@@ -908,7 +893,9 @@ function reducer(state, action) {
       return { ...state, nonce: state.nonce + 1 }
     case 'loadStart':
       return { ...state, loading: true, error: null }
-    case 'loadRootOk':
+    case 'loadRootOk': {
+      // 同根刷新（面板可见即刷新）保留展开/分支/筛选词；换根才清空
+      const same = state.root === action.path
       return {
         ...state,
         loading: false,
@@ -917,10 +904,11 @@ function reducer(state, action) {
         crumbs: action.crumbs,
         entries: action.entries,
         truncated: action.truncated,
-        branches: {},          // 换根时清空已展开分支
-        expanded: {},
-        term: ''
+        branches: same ? state.branches : {},
+        expanded: same ? state.expanded : {},
+        term: same ? state.term : ''
       }
+    }
     case 'loadFail':
       return { ...state, loading: false, error: action.error }
     case 'toggle': {
@@ -953,9 +941,6 @@ function reducer(state, action) {
       return { ...state, files: { ...state.files, [action.path]: { status: 'err', error: action.error } } }
     case 'toggleSource':
       return { ...state, sourceMode: !state.sourceMode }
-    case 'restoreTree':
-      // 工作区切换恢复：还原该工作区的树展开状态（branches 内容缓存保留）
-      return { ...state, expanded: action.expanded || {} }
     default:
       return state
   }
@@ -1179,7 +1164,7 @@ function FilePreview({ state }) {
 }
 
 // ---------- 文件树栏（右侧窄栏：筛选 + 目录文件树；左缘可拖拽调宽） ----------
-function TreeColumn({ workspaces, state, dispatch, width, onResizeStart, tabKind }) {
+function TreeColumn({ state, dispatch, width, onResizeStart, tabKind }) {
   function entryMatchesDeep(entry) {
     if (matches(state.term, entry.name)) return true
     if (entry.type !== 'directory') return false
@@ -1288,11 +1273,8 @@ function TabStrip() {
   // 悬停的页签被关闭/隐藏（切工作区、关闭×）时气泡自检隐藏——元素移除不会触发 mouseleave
   if (pathTip && !panel.tabs.some((t) => t.id === pathTip.id)) setPathTip(null)
   const tabLabel = (t) => {
-    // 文件页签显示归属工作区（项目文件夹）前缀：工作区/文件名
-    if (t.kind === 'file') {
-      const ws = wsDisplayName(panel.ws)
-      return ws ? ws + '/' + baseName(t.path) : baseName(t.path)
-    }
+    // 页签本就按工作区分组，文件页签只显示文件名（完整路径走悬停气泡）
+    if (t.kind === 'file') return baseName(t.path)
     if (t.kind === 'files') return '打开文件'
     if (t.kind === 'chat') return '侧边聊天'
     return (panel.browser[t.id] && panel.browser[t.id].title) || '新标签页'
@@ -1361,87 +1343,18 @@ function TabStrip() {
   )
 }
 
-// ---------- 主面板（渲染在原生 details 右栏内：左预览 + 右树栏，顶部双栏） ----------
-function FileTreePanel({ workspaces, sessions, sessionId }) {
-  const [state, dispatch] = React.useReducer(reducer, undefined, initState)
-
-  // 注册程序化打开入口：会话内点击文件引用经此在面板中预览
-  React.useEffect(() => {
-    panelFileDispatch = (p) => openFileTab(p)
-    panelDirDispatch = (p) => dispatch({ type: 'gotoRoot', root: p })
-    return () => { panelFileDispatch = null; panelDirDispatch = null }
-  }, [dispatch])
-  // 统一页签仓库 -> 激活文件派生：文件页签激活时预览该文件，其余页签时显示树浏览器
+// ---------- 主面板外壳（渲染在原生 details 右栏内） ----------
+// 外壳常驻：统一页签条 + ⤢ + 聊天 / 浏览器 / 文件视图切换。文件视图按工作区 key
+// 挂载，切工作区即换实例——目录树状态天然隔离，无需手工快照/还原。
+function FileTreePanel({ sessions, workspaces, sessionId }) {
+  // 首帧同步定位当前工作区：FilesView 才能以正确的 key 一次挂载到位（避免二次挂载）
+  if (!currentWs) ensureCurrentWs()
+  const wsKey = currentWs
+  const wsPath = P().path
   const activeTab = useActiveTab()
-  React.useEffect(() => {
-    // 防御：隐藏的其他工作区文件页签不参与预览（activePath 只认当前工作区的文件页签）
-    const p = activeTab && activeTab.kind === 'file' ? activeTab.path : null
-    if (p !== state.activePath) dispatch({ type: 'setActive', path: p })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, state.activePath])
+  const [panelOpen] = usePanelOpen()
   // 右栏可见性：原生列收起时宽度为 0（仍挂载）——宽度 > 80px 视为展开，才加载数据
   const [visible, setVisible] = React.useState(false)
-  // 树栏宽度（模块级记忆）；树栏开关；工作区根（区别于树当前浏览目录
-  // state.root——目录引用点击只导航不换工作区）
-  const [treeW, setTreeW] = React.useState(treeWidth)
-  const [treeOn, setTreeOn] = React.useState(true)
-  const panelOpen = usePanelOpen()
-
-  // 工作区切换：恢复该面板的面板开合与树状态（页签由面板会话自带）
-  React.useEffect(() => {
-    const p = P()
-    if (!p) return
-    if (p.panelOpen != null) {
-      // 展开态工作区：无条件确保展开（会话切换可能被原生 layout 收起，模块
-      // panelOpen 仍为 true 会误判"已展开"，故不以其为真值，幂等重调 openDetails）；
-      // 并延迟复断一次，防原生收起发生在恢复之后
-      if (p.panelOpen) {
-        openPanelWithRoom()
-        setTimeout(() => {
-          if (currentWs && P() === p && p.panelOpen) openPanelWithRoom()
-        }, 80)
-      } else if (panelOpen) closePanel()
-    }
-    if (p.expanded) dispatch({ type: 'restoreTree', expanded: p.expanded })
-    if (p.treeOn != null) setTreeOn(p.treeOn)
-    if (p.treeW != null) { treeWidth = p.treeW; setTreeW(p.treeW) }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentWs])
-
-  // 当前面板状态持续回写（树展开/树栏/面板开合 → 所属工作区面板，随工作区持久化）
-  React.useEffect(() => {
-    const p = P()
-    if (!p) return
-    p.panelOpen = panelOpen
-    p.expanded = state.expanded
-    p.treeOn = treeOn
-    p.treeW = treeW
-    persistPanels()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentWs, panelOpen, state.expanded, treeOn, treeW])
-
-  // 持续跟踪当前工作区：workspaces.list 的 recentWorkspaceId 变化（用户在侧边栏
-  // 切换工作区时 dsh 会更新它）→ 重解析根目录并切换面板。这条路径覆盖"通过
-  // composer 工作区选择器切换"等不改变会话 id 的场景。
-  React.useEffect(() => {
-    if (!workspaces || !workspaces.list) return
-    let lastWs = state.root
-    const check = () => {
-      try {
-        const snap = workspaces.list.getSnapshot()
-        if (!snap || !snap.items || !snap.items.length) return
-        const rec = snap.items.find((w) => w.workspaceId === snap.recentWorkspaceId)
-        const chosen = rec || snap.items[0]
-        if (chosen && chosen.path && chosen.path !== state.root) {
-          dispatch({ type: 'setRoot', root: chosen.path })
-        }
-      } catch { /* 忽略 */ }
-    }
-    check()
-    const un = workspaces.list.subscribe(check)
-    return () => { un(); }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible, state.root])
 
   // 跟踪原生右栏列宽 → 可见性
   React.useEffect(() => {
@@ -1454,85 +1367,129 @@ function FileTreePanel({ workspaces, sessions, sessionId }) {
     return () => ro.disconnect()
   }, [])
 
-  // 面板可见时才解析默认根目录。优先级：
-  //   1) 当前会话的工作目录 cwd（用户正在聊天的项目）
-  //   2) workspaces 列表（最近优先 -> 首个）
-  // 两个存储都是异步装载的（服务重启后面板首开时快照可能还是空的），
-  // 因此先立即试一次，未就绪就订阅等数据到达后再落根。
+  // 工作区跟随（唯一入口）：会话切换（sessionId prop）、会话列表、工作区列表任一变化
+  // 都重解析——覆盖侧边栏切会话、工作区选择器切工作区、存储异步装载完成三条路径。
   React.useEffect(() => {
-    if (!visible || state.root !== undefined) return
-    let disposed = false
-    const unsubs = []
-    const resolve = () => {
-      const root = resolveDefaultRoot(sessionId)
-      if (disposed) return true
-      if (root !== null) {
-        dispatch({ type: 'setRoot', root })
-        setWorkspace(root)
-        return true
-      }
-      return false
-    }
-    if (resolve()) return
-    const onChange = () => {
-      if (resolve() && unsubs.length) unsubs.forEach((u) => u())
-    }
+    const apply = () => { const ws = resolveCurrentWs(sessionId); if (ws) setWorkspace(ws.key, ws.path) }
+    apply()
+    const un = []
     try {
-      unsubs.push(sessions.list.subscribe(onChange))
-      unsubs.push(workspaces.list.subscribe(onChange))
-    } catch (e) { console.error('[fsviewer] subscribe root sources:', e) }
-    return () => { disposed = true; unsubs.forEach((u) => u()) }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible])
-
-  // 会话/工作区切换：重解析根目录（会话 cwd 优先），树与文件页签跟随当前工作区。
-  // 切换瞬间快照可能滞后（ss.current 未更新），未解析成功就订阅等待数据到达后补跑。
-  const lastSession = React.useRef(null)
-  React.useEffect(() => {
-    window.__fsvSessEffect = (window.__fsvSessEffect || 0) + 1
-    window.__fsvSessId = sessionId
-    if (lastSession.current === null) { lastSession.current = sessionId; return }
-    if (lastSession.current === sessionId) return
-    lastSession.current = sessionId
-    let disposed = false
-    const unsubs = []
-    const tryApply = () => {
-      const root = resolveDefaultRoot(sessionId)
-      window.__fsvTry = { root: root && root.split('/').pop(), cur: currentWs && currentWs.split('/').pop(), sessionId: String(sessionId || '').slice(0, 10) }
-      if (disposed || root === null) return false
-      dispatch({ type: 'gotoRoot', root })
-      setWorkspace(root)
-      return true
-    }
-    if (tryApply()) return
-    const onChange = () => {
-      if (tryApply() && unsubs.length) unsubs.forEach((u) => u())
-    }
-    try {
-      unsubs.push(sessions.list.subscribe(onChange))
-      unsubs.push(workspaces.list.subscribe(onChange))
-    } catch (e) { console.error('[fsviewer] ws switch subscribe:', e) }
-    // 订阅存在竞态（快照可能在订阅前已更新、之后不再 push）：轮询兜底，成功或超时收敛
-    let tries = 0
-    const timer = setInterval(() => {
-      if (disposed || tryApply() || ++tries > 24) {
-        clearInterval(timer)
-        unsubs.forEach((u) => u())
-      }
-    }, 250)
-    return () => { disposed = true; unsubs.forEach((u) => u()) }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+      if (sessions && sessions.list) un.push(sessions.list.subscribe(apply))
+      if (workspaces && workspaces.list) un.push(workspaces.list.subscribe(apply))
+    } catch (e) { console.error('[fsviewer] subscribe workspace sources:', e) }
+    return () => un.forEach((u) => u && u())
   }, [sessionId])
 
-  // 每次面板可见自动刷新根目录层：会话中新产生的文件立即可见
+  // 挂载后恢复本工作区记住的面板开合（开合要调原生 layout，不能在渲染期做）。
+  // 展开态幂等确保展开 + 延迟复断一次，防原生收起晚于恢复。
   React.useEffect(() => {
-    if (visible && state.root) dispatch({ type: 'refresh' })
+    const p = P()
+    if (!p || !p.panelOpen) return
+    openPanelWithRoom()
+    setTimeout(() => { if (currentWs === wsKey && p.panelOpen) openPanelWithRoom() }, 80)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible])
+  }, [])
 
-  // root/nonce 变化 -> 加载根目录层（主机路由：目录 + 文件）
+  // 面板开合写入所属工作区（随工作区持久化；工作区切换的快照/恢复在 setWorkspace 内）
   React.useEffect(() => {
-    if (!state.root) return
+    const p = P()
+    if (p) { p.panelOpen = panelOpen; persistPanels() }
+  }, [panelOpen])
+
+  // ⤢ 加宽/还原：原生布局服务不暴露 setDetails（宽度合同 300-520 只能靠拖拽把手，
+  // 而把手对合成 pointer 有保护、无法程序化拖拽），故用 CSS !important 覆盖
+  // AppFrame 的网格列宽实现「加宽到上限 520」；还原 = 移除覆盖类，恢复原生内联样式。
+  const [wide, setWide] = React.useState(wideOn)
+  const toggleWide = () => {
+    wideOn = !wideOn
+    setWide(wideOn)
+    if (wideOn) {
+      pinMode = 'wide'
+      setFramePin(520)
+      return
+    }
+    // 还原：若极小窗口挤压仍在生效则回到挤压宽度，否则完全交还原生
+    pinMode = null
+    const sidebarW = sidebarRenderedWidth()
+    if (window.innerWidth - sidebarW - CENTER_MIN_PX < DETAILS_MIN_PX) applySqueezeIfNeeded(sidebarW)
+    else setFramePin(null)
+  }
+
+  const kind = activeTab ? activeTab.kind : 'empty'
+  return (
+    <div style={{
+      width: '100%',
+      height: '100%',
+      backgroundColor: V.fill,
+      color: V.fg,
+      overflow: 'hidden',
+      display: 'flex',
+      flexDirection: 'column',
+      fontFamily: V.font,
+      fontSize: '13px'
+    }}>
+      {/* 行1：统一页签条（打开文件 | 侧边聊天 | 浏览器页签 | +菜单）… ⤢ 加宽/还原 */}
+      <div style={{ display: 'flex', alignItems: 'center', minHeight: 56, borderBottom: '1px solid ' + V.line, flex: '0 0 auto', paddingRight: 6 }}>
+        <TabStrip />
+        <div style={{ display: 'flex', alignItems: 'center', marginLeft: 'auto', flex: '0 0 auto' }}>
+          <button type="button" onClick={toggleWide} data-tip={wide ? '恢复默认宽度' : '加宽面板（最大 520px）'} aria-label="切换加宽"
+            className={'fsviewer-iconbtn fsviewer-tip' + (wide ? ' fsviewer-iconbtn--active' : '')}><IconMaximize /></button>
+        </div>
+      </div>
+      {kind === 'chat' ? (
+        <ChatPanel chatId={activeTab.id} />
+      ) : kind === 'browser' ? (
+        <BrowserPane tabId={activeTab.id} />
+      ) : kind === 'empty' ? (
+        <EmptyTabsState />
+      ) : (
+        <FilesView key={wsKey} root={wsPath} visible={visible} />
+      )}
+    </div>
+  )
+}
+
+// ---------- 文件视图（目录树 + 预览）：每个工作区一份独立状态 ----------
+// 挂载在 key={wsKey} 下：切工作区时 React 换实例，树展开、分支缓存、筛选词、
+// 文件内容缓存、树栏开关与宽度随工作区走；初值取该工作区面板记住的状态。
+function FilesView({ root, visible }) {
+  const [state, dispatch] = React.useReducer(reducer, P(), initState)
+  const [treeW, setTreeW] = React.useState(P().treeW)
+  const [treeOn, setTreeOn] = React.useState(P().treeOn !== false)
+  const activeTab = useActiveTab()
+
+  // 注册程序化打开入口：会话内点击目录引用经此在面板树定位
+  React.useEffect(() => {
+    panelDirDispatch = (p) => dispatch({ type: 'gotoRoot', root: p })
+    return () => { panelDirDispatch = null }
+  }, [])
+  // 工作区目录变化（首帧未解析出路径 / 工作区切换后路径变更）→ 树根跟随；
+  // 目录引用点击时 FilesView 可能尚未挂载，目标暂存于 pendingDirJump，挂载后消费
+  React.useEffect(() => {
+    if (pendingDirJump) {
+      const dir = pendingDirJump
+      pendingDirJump = null
+      dispatch({ type: 'gotoRoot', root: dir })
+    } else if (root && root !== state.root) dispatch({ type: 'gotoRoot', root })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [root])
+  // 统一页签仓库 -> 激活文件派生：文件页签激活时预览该文件，其余页签时空状态
+  React.useEffect(() => {
+    const p = activeTab && activeTab.kind === 'file' ? activeTab.path : null
+    if (p !== state.activePath) dispatch({ type: 'setActive', path: p })
+  }, [activeTab, state.activePath])
+  // 树状态回写所属工作区（随工作区持久化）
+  React.useEffect(() => {
+    const p = P()
+    if (!p) return
+    p.expanded = state.expanded; p.treeOn = treeOn; p.treeW = treeW
+    persistPanels()
+  }, [state.expanded, treeOn, treeW])
+
+  // root/nonce/可见性 变化 -> 加载根目录层（主机路由：目录 + 文件）。
+  // 面板每次展开（列宽 0 → 可见）都会重跑一次，会话中新产生的文件立即可见。
+  React.useEffect(() => {
+    if (!visible || !state.root) return
     let alive = true
     dispatch({ type: 'loadStart' })
     fetchList(state.root).then(
@@ -1541,7 +1498,7 @@ function FileTreePanel({ workspaces, sessions, sessionId }) {
     )
     return () => { alive = false }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.root, state.nonce])
+  }, [state.root, state.nonce, visible])
 
   // 首次展开的目录 -> 懒加载子目录。
   // cleanup 里统一作废：切换根目录/再次切换展开状态后，迟到的旧响应直接丢弃，
@@ -1590,11 +1547,8 @@ function FileTreePanel({ workspaces, sessions, sessionId }) {
   const onTreeResizeStart = (e) => {
     e.preventDefault()
     const startX = e.clientX
-    const startW = treeWidth
-    const move = (ev) => {
-      treeWidth = Math.min(Math.max(startW + (startX - ev.clientX), 120), 320)
-      setTreeW(treeWidth)
-    }
+    const startW = treeW
+    const move = (ev) => { setTreeW(Math.min(Math.max(startW + (startX - ev.clientX), 120), 320)) }
     const up = () => {
       window.removeEventListener('pointermove', move)
       window.removeEventListener('pointerup', up)
@@ -1605,27 +1559,8 @@ function FileTreePanel({ workspaces, sessions, sessionId }) {
     window.addEventListener('pointerup', up)
   }
 
-  // ⤢ 加宽/还原：原生布局服务不暴露 setDetails（宽度合同 300-520 只能靠拖拽把手，
-  // 而把手对合成 pointer 有保护、无法程序化拖拽），故用 CSS !important 覆盖
-  // AppFrame 的网格列宽实现「加宽到上限 520」；还原 = 移除覆盖类，恢复原生内联样式。
-  const [wide, setWide] = React.useState(wideOn)
-  const toggleWide = () => {
-    wideOn = !wideOn
-    setWide(wideOn)
-    if (wideOn) {
-      pinMode = 'wide'
-      setFramePin(520)
-      return
-    }
-    // 还原：若极小窗口挤压仍在生效则回到挤压宽度，否则完全交还原生
-    pinMode = null
-    const sidebarW = sidebarRenderedWidth()
-    if (window.innerWidth - sidebarW - CENTER_MIN_PX < DETAILS_MIN_PX) applySqueezeIfNeeded(sidebarW)
-    else setFramePin(null)
-  }
-
   const activeFile = state.activePath ? state.files[state.activePath] : null
-  const kind = activeTab ? activeTab.kind : 'empty'
+  const kind = activeTab ? activeTab.kind : 'files'
   const showSourceBtn = !!(state.activePath && isMdFile(baseName(state.activePath)) && activeFile && activeFile.status === 'ok' && !activeFile.binary)
   // ⧉ 打开 = 在系统文件管理器中打开文件所在文件夹（macOS：Finder，Windows：资源管理器）
   const openFolderInSystem = () => {
@@ -1634,63 +1569,35 @@ function FileTreePanel({ workspaces, sessions, sessionId }) {
   const openFolderTip = /Mac/i.test(navigator.platform || navigator.userAgent) ? '在 Finder 中打开' : '在文件夹中打开'
 
   return (
-    <div style={{
-      width: '100%',
-      height: '100%',
-      backgroundColor: V.fill,
-      color: V.fg,
-      overflow: 'hidden',
-      display: 'flex',
-      flexDirection: 'column',
-      fontFamily: V.font,
-      fontSize: '13px'
-    }}>
-      {/* 行1：统一页签条（打开文件 | 侧边聊天 | 浏览器页签 | +菜单）… ⤢ 加宽/还原 */}
-      <div style={{ display: 'flex', alignItems: 'center', minHeight: 56, borderBottom: '1px solid ' + V.line, flex: '0 0 auto', paddingRight: 6 }}>
-        <TabStrip />
-        <div style={{ display: 'flex', alignItems: 'center', marginLeft: 'auto', flex: '0 0 auto' }}>
-          <button type="button" onClick={toggleWide} data-tip={wide ? '恢复默认宽度' : '加宽面板（最大 520px）'} aria-label="切换加宽"
-            className={'fsviewer-iconbtn fsviewer-tip' + (wide ? ' fsviewer-iconbtn--active' : '')}><IconMaximize /></button>
-        </div>
+    <>
+      {/* 行2：面包屑 … 查看源代码 / 文件夹（收展树栏）/ 打开。右边距与行1一致，文件夹与 ⤢ 右缘对齐 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 6px 4px 10px', borderBottom: '1px solid ' + V.line, flex: '0 0 auto' }}>
+        <span style={{ flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, color: V.muted }}>
+          {state.root ? baseName(state.root) : '…'}
+          {state.activePath ? <span><span style={{ color: V.edge }}> › </span><span style={{ color: V.fg }}>{baseName(state.activePath)}</span></span> : null}
+        </span>
+        {showSourceBtn
+          ? <button type="button" onClick={() => dispatch({ type: 'toggleSource' })} title="切换渲染/源码视图"
+            style={{ cursor: 'pointer', flex: '0 0 auto', height: 28, fontSize: 12, lineHeight: 1, padding: '0 10px', borderRadius: 6, border: '1px solid ' + V.line, background: state.sourceMode ? V.input : 'transparent', color: V.fg, display: 'inline-flex', alignItems: 'center' }}>
+            {state.sourceMode ? '渲染视图' : '查看源代码'}</button>
+          : null}
+        <button type="button" onClick={() => setTreeOn(!treeOn)} data-tip={treeOn ? '收起文件树' : '展开文件树'} aria-label="切换文件树"
+          className={'fsviewer-iconbtn fsviewer-tip' + (treeOn ? ' fsviewer-iconbtn--active' : '')}>
+          <IconFolder />
+        </button>
+        {state.activePath
+          ? <button type="button" onClick={openFolderInSystem} data-tip={openFolderTip} aria-label={openFolderTip}
+            className="fsviewer-tip"
+            style={{ cursor: 'pointer', flex: '0 0 auto', height: 28, fontSize: 12, lineHeight: 1, padding: '0 8px', borderRadius: 6, border: '1px solid ' + V.line, background: 'transparent', color: V.fg, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+            <IconFinder />打开</button>
+          : null}
       </div>
-      {kind === 'chat' ? (
-        <ChatPanel chatId={activeTab.id} />
-      ) : kind === 'browser' ? (
-        <BrowserPane tabId={activeTab.id} />
-      ) : kind === 'empty' ? (
-        <EmptyTabsState />
-      ) : (
-        <>
-        {/* 行2：面包屑 … 查看源代码 / 文件夹（收展树栏）/ 打开。右边距与行1一致，文件夹与 ⤢ 右缘对齐 */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 6px 4px 10px', borderBottom: '1px solid ' + V.line, flex: '0 0 auto' }}>
-          <span style={{ flex: '1 1 auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 12, color: V.muted }}>
-            {state.root ? baseName(state.root) : '…'}
-            {state.activePath ? <span><span style={{ color: V.edge }}> › </span><span style={{ color: V.fg }}>{baseName(state.activePath)}</span></span> : null}
-          </span>
-          {showSourceBtn
-            ? <button type="button" onClick={() => dispatch({ type: 'toggleSource' })} title="切换渲染/源码视图"
-              style={{ cursor: 'pointer', flex: '0 0 auto', height: 28, fontSize: 12, lineHeight: 1, padding: '0 10px', borderRadius: 6, border: '1px solid ' + V.line, background: state.sourceMode ? V.input : 'transparent', color: V.fg, display: 'inline-flex', alignItems: 'center' }}>
-              {state.sourceMode ? '渲染视图' : '查看源代码'}</button>
-            : null}
-          <button type="button" onClick={() => setTreeOn(!treeOn)} data-tip={treeOn ? '收起文件树' : '展开文件树'} aria-label="切换文件树"
-            className={'fsviewer-iconbtn fsviewer-tip' + (treeOn ? ' fsviewer-iconbtn--active' : '')}>
-            <IconFolder />
-          </button>
-          {state.activePath
-            ? <button type="button" onClick={openFolderInSystem} data-tip={openFolderTip} aria-label={openFolderTip}
-              className="fsviewer-tip"
-              style={{ cursor: 'pointer', flex: '0 0 auto', height: 28, fontSize: 12, lineHeight: 1, padding: '0 8px', borderRadius: 6, border: '1px solid ' + V.line, background: 'transparent', color: V.fg, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-              <IconFinder />打开</button>
-            : null}
-        </div>
-        {/* 内容：左预览（无激活文件时空状态） | 右文件树栏（可拖拽调宽） */}
-        <div style={{ flex: '1 1 auto', display: 'flex', minHeight: 0 }}>
-          {state.activePath ? <FilePreview state={state} /> : <EmptyState />}
-          {treeOn ? <TreeColumn workspaces={workspaces} state={state} dispatch={dispatch} width={treeW} onResizeStart={onTreeResizeStart} tabKind={kind} /> : null}
-        </div>
-        </>
-      )}
-    </div>
+      {/* 内容：左预览（无激活文件时空状态） | 右文件树栏（可拖拽调宽） */}
+      <div style={{ flex: '1 1 auto', display: 'flex', minHeight: 0 }}>
+        {state.activePath ? <FilePreview state={state} /> : <EmptyState />}
+        {treeOn ? <TreeColumn state={state} dispatch={dispatch} width={treeW} onResizeStart={onTreeResizeStart} tabKind={kind} /> : null}
+      </div>
+    </>
   )
 }
 
