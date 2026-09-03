@@ -71,19 +71,18 @@ function wsDisplayName(root) {
  *  回落当前会话 cwd */
 function resolveDefaultRoot(sessionId) {
   try {
+    // 会话 cwd 优先（跟随会话切换，sessions.current 滞后时由 sessionId 兜底）
+    const ss = sessionsSvc && sessionsSvc.list && sessionsSvc.list.getSnapshot()
+    if (ss && ss.byId) {
+      const sid = (sessionId && ss.byId[sessionId]) ? sessionId : ss.current
+      if (sid !== undefined && ss.byId[sid] && ss.byId[sid].cwd) return ss.byId[sid].cwd
+    }
+    // 回落：workspaces 最近使用项
     const snap = workspacesSvc && workspacesSvc.list && workspacesSvc.list.getSnapshot()
     if (snap && snap.items && snap.items.length) {
       const rec = snap.items.find((w) => w.workspaceId === snap.recentWorkspaceId)
       const chosen = rec || snap.items[0]
       if (chosen && chosen.path) return chosen.path
-    }
-    const ss = sessionsSvc && sessionsSvc.list && sessionsSvc.list.getSnapshot()
-    if (ss && ss.byId) {
-      const sid = (sessionId && ss.byId[sessionId]) ? sessionId : ss.current
-      if (sid !== undefined && ss.byId[sid]) {
-        const rec = ss.byId[sid]
-        if (rec && rec.cwd) return rec.cwd
-      }
     }
   } catch (e) { console.error('[fsviewer] resolve default root:', e) }
   return null
@@ -1421,6 +1420,29 @@ function FileTreePanel({ workspaces, sessions, sessionId }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentWs, panelOpen, state.expanded, treeOn, treeW])
 
+  // 持续跟踪当前工作区：workspaces.list 的 recentWorkspaceId 变化（用户在侧边栏
+  // 切换工作区时 dsh 会更新它）→ 重解析根目录并切换面板。这条路径覆盖"通过
+  // composer 工作区选择器切换"等不改变会话 id 的场景。
+  React.useEffect(() => {
+    if (!workspaces || !workspaces.list) return
+    let lastWs = state.root
+    const check = () => {
+      try {
+        const snap = workspaces.list.getSnapshot()
+        if (!snap || !snap.items || !snap.items.length) return
+        const rec = snap.items.find((w) => w.workspaceId === snap.recentWorkspaceId)
+        const chosen = rec || snap.items[0]
+        if (chosen && chosen.path && chosen.path !== state.root) {
+          dispatch({ type: 'setRoot', root: chosen.path })
+        }
+      } catch { /* 忽略 */ }
+    }
+    check()
+    const un = workspaces.list.subscribe(check)
+    return () => { un(); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible, state.root])
+
   // 跟踪原生右栏列宽 → 可见性
   React.useEffect(() => {
     const col = document.querySelector('[class*="detailsCol"]')
@@ -1442,7 +1464,7 @@ function FileTreePanel({ workspaces, sessions, sessionId }) {
     let disposed = false
     const unsubs = []
     const resolve = () => {
-      const root = resolveDefaultRoot()
+      const root = resolveDefaultRoot(sessionId)
       if (disposed) return true
       if (root !== null) {
         dispatch({ type: 'setRoot', root })
@@ -1475,7 +1497,8 @@ function FileTreePanel({ workspaces, sessions, sessionId }) {
     let disposed = false
     const unsubs = []
     const tryApply = () => {
-      const root = resolveDefaultRoot()
+      const root = resolveDefaultRoot(sessionId)
+      window.__fsvTry = { root: root && root.split('/').pop(), cur: currentWs && currentWs.split('/').pop(), sessionId: String(sessionId || '').slice(0, 10) }
       if (disposed || root === null) return false
       dispatch({ type: 'gotoRoot', root })
       setWorkspace(root)
